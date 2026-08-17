@@ -1,0 +1,34 @@
+[package]
+name = "liteexif"
+version = "2.1.5"
+description = "Batch photo watermark and EXIF layout tool"
+authors = ["LiteExif contributors"]
+edition = "2021"
+
+[lib]
+name = "liteexif_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+imageproc = "0.25"
+jpeg-encoder = "0.6"
+minijinja = { version = "2", features = ["builtins"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+walkdir = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+] }

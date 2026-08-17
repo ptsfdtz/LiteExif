@@ -1,0 +1,12 @@
+.idea
+.DS_Store
+release
+input
+output
+logos/logo_psds
+exiftool
+dist
+node_modules
+logs
+tmp
+src-tauri/target

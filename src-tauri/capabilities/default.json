@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Desktop permissions for LiteExif",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}
