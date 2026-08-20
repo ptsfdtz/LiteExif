@@ -2,7 +2,7 @@ mod engine;
 
 use engine::{
     copy_runtime_resources, get_exif, list_files as scan_files, list_templates, load_image,
-    process_pipeline, process_pipeline_preview, render_template, save_image, IniConfig,
+    process_pipeline, process_pipeline_preview_from_image, render_template, save_image, IniConfig,
 };
 use rayon::prelude::*;
 use serde_json::{json, Value};
@@ -199,19 +199,30 @@ async fn prepare_processed_preview(
         let mut exif = get_exif(&root, &source);
         let original = load_image(&source)?;
         let largest_side = original.width().max(original.height());
-        let scale = if largest_side > 1600 {
-            1600.0 / largest_side as f64
+        // A preview should be quick and fit the preview surface.  Rendering a
+        // 1600px source with a large blur radius can consume gigabytes before
+        // the user sees anything, especially for portrait photographs.
+        const PREVIEW_MAX_DIMENSION: u32 = 512;
+        let scale = if largest_side > PREVIEW_MAX_DIMENSION {
+            PREVIEW_MAX_DIMENSION as f64 / largest_side as f64
         } else {
             1.0
         };
-        exif.insert(
-            "ImageWidth".to_owned(),
-            ((original.width() as f64 * scale) as u32).to_string(),
-        );
-        exif.insert(
-            "ImageHeight".to_owned(),
-            ((original.height() as f64 * scale) as u32).to_string(),
-        );
+        // The Python implementation renders vw/vh from ExifTool's original
+        // dimensions, then applies EXIF orientation while decoding pixels.
+        // Do not replace them with the oriented dimensions here: that swaps
+        // template geometry for portrait photos carrying an orientation tag.
+        let exif_dimension = |key: &str, fallback: u32| {
+            exif.get(key)
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(fallback)
+        };
+        let preview_exif_width =
+            (exif_dimension("ImageWidth", original.width()) as f64 * scale) as u32;
+        let preview_exif_height =
+            (exif_dimension("ImageHeight", original.height()) as f64 * scale) as u32;
+        exif.insert("ImageWidth".to_owned(), preview_exif_width.to_string());
+        exif.insert("ImageHeight".to_owned(), preview_exif_height.to_string());
         let rendered = render_template(&root, &template, &exif, &source, &[])?;
         let nodes: Vec<Value> = serde_json::from_str(&rendered)
             .map_err(|error| format!("模板渲染结果无效: {error}"))?;
@@ -235,7 +246,13 @@ async fn prepare_processed_preview(
         fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
         let target = cache.join(format!("{:016x}.jpg", hasher.finish()));
         if !target.exists() {
-            let preview = process_pipeline_preview(&root, &nodes, &source, 1600)?;
+            let preview = process_pipeline_preview_from_image(
+                &root,
+                &nodes,
+                &source,
+                original,
+                PREVIEW_MAX_DIMENSION,
+            )?;
             save_image(&target, &preview, 75, 2)?;
         }
         Ok(json!({"path":target}))
@@ -260,11 +277,20 @@ async fn start_processing(app: AppHandle, selected_items: Vec<String>) -> Result
         let processed = AtomicUsize::new(0); let success = AtomicUsize::new(0); let failure = AtomicUsize::new(0); let skipped = AtomicUsize::new(0);
         app.emit("processing-progress", json!({"event":"start","data":{"total":total,"processed":0,"success":0,"failure":0,"skipped":0,"percent":0,"message":format!("开始处理 {total} 个文件")}})).map_err(|error| error.to_string())?;
 
-        selected_items.par_iter().for_each(|item| {
+        // Full-resolution blur templates retain multiple frame-sized buffers.
+        // Keep batch parallelism bounded so several camera originals cannot
+        // exhaust memory before the first export finishes.
+        let worker_count = selected_items.len().clamp(1, 2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .build()
+            .map_err(|error| error.to_string())?
+            .install(|| selected_items.par_iter().for_each(|item| {
             let source = PathBuf::from(item);
             let name = source.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let relative = source.strip_prefix(&input_root).unwrap_or(&source);
             let target = output_root.join(relative);
+            let _ = app.emit("processing-progress", json!({"event":"progress","data":{"total":total,"processed":processed.load(Ordering::Relaxed),"success":success.load(Ordering::Relaxed),"failure":failure.load(Ordering::Relaxed),"skipped":skipped.load(Ordering::Relaxed),"current":name,"percent":if total==0{100}else{processed.load(Ordering::Relaxed)*100/total},"message":format!("正在处理: {name}")}}));
             let status = if target.exists() && !overwrite { skipped.fetch_add(1, Ordering::Relaxed); "skipped" }
             else {
                 let result = (|| -> Result<(), String> {
@@ -279,7 +305,7 @@ async fn start_processing(app: AppHandle, selected_items: Vec<String>) -> Result
             let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
             let labels = match status { "success"=>"完成", "skipped"=>"跳过", _=>"失败" };
             let _ = app.emit("processing-progress", json!({"event":"progress","data":{"total":total,"processed":done,"success":success.load(Ordering::Relaxed),"failure":failure.load(Ordering::Relaxed),"skipped":skipped.load(Ordering::Relaxed),"current":name,"percent":if total==0{100}else{done*100/total},"message":format!("{labels}: {name}")}}));
-        });
+        }));
         let result = json!({"total":total,"processed":processed.load(Ordering::Relaxed),"success":success.load(Ordering::Relaxed),"failure":failure.load(Ordering::Relaxed),"skipped":skipped.load(Ordering::Relaxed),"percent":100,"message":format!("处理完成：成功 {}，跳过 {}，失败 {}",success.load(Ordering::Relaxed),skipped.load(Ordering::Relaxed),failure.load(Ordering::Relaxed))});
         app.emit("processing-progress", json!({"event":"complete","data":result})).map_err(|error| error.to_string())?;
         Ok(result)

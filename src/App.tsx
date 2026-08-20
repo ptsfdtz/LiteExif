@@ -127,15 +127,28 @@ export default function App() {
     });
   };
 
-  const showPreview = async (node: FileNode, processed = false) => {
+  const showPreview = async (node: FileNode, processed = false, template = config.template) => {
     if (!node.value) return;
     const request = ++previewRequest.current;
     setPreviewLoading(true);
     try {
-      const result = await invoke<{ path: string }>(
-        processed ? "prepare_processed_preview" : "prepare_preview",
-        processed ? { path: node.value, template: config.template } : { path: node.value },
-      );
+      const isHeic = /\.hei[cf]$/i.test(node.value);
+      if (!isHeic) {
+        // JPEG and PNG do not need an IPC round trip.  Showing them through
+        // Tauri's asset protocol makes photo-to-photo switching immediate.
+        setPreview({ path: node.value, name: node.label, url: convertFileSrc(node.value) });
+      } else {
+        const source = await invoke<{ path: string }>("prepare_preview", { path: node.value });
+        if (request === previewRequest.current) {
+          setPreview({ path: node.value, name: node.label, url: convertFileSrc(source.path) });
+        }
+      }
+      if (!processed || request !== previewRequest.current) return;
+
+      const result = await invoke<{ path: string }>("prepare_processed_preview", {
+        path: node.value,
+        template,
+      });
       if (request === previewRequest.current) {
         setPreview({ path: node.value, name: node.label, url: convertFileSrc(result.path) });
       }
@@ -157,6 +170,9 @@ export default function App() {
     try {
       const result = await invoke<{ content: string }>("get_template", { templateName });
       setConfig((value) => ({ ...value, template_name: templateName, template: result.content }));
+      if (preview) {
+        void showPreview({ label: preview.name, value: preview.path, is_file: true }, true, result.content);
+      }
     } catch (error) {
       notify(`模板加载失败：${errorMessage(error)}`, "error");
     }
