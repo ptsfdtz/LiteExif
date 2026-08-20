@@ -1,8 +1,10 @@
 mod engine;
+mod gpu;
 
 use engine::{
-    copy_runtime_resources, get_exif, list_files as scan_files, list_templates, load_image,
-    process_pipeline, process_pipeline_preview_from_image, render_template, save_image, IniConfig,
+    copy_runtime_resources, get_exif, gpu_acceleration_status, initialize_gpu_acceleration,
+    list_files as scan_files, list_templates, load_image, process_pipeline,
+    process_pipeline_preview_from_image, render_template, save_image, IniConfig,
 };
 use rayon::prelude::*;
 use serde_json::{json, Value};
@@ -111,6 +113,18 @@ fn list_files(app: AppHandle) -> Result<Value, String> {
         "input_files": [{"children": scan_files(&input, &suffixes), "label":"Root"}],
         "output_files": [{"children": scan_files(&output, &suffixes), "label":"Root"}],
     }))
+}
+
+#[tauri::command]
+fn get_acceleration_status() -> Value {
+    let (state, adapter) = gpu_acceleration_status();
+    json!({
+        "backend": if state == "validated" { "GPU (DX12 compute)" } else { "CPU" },
+        "state": state,
+        "adapter": adapter,
+        "pixel_exact": state == "validated",
+        "scope": "preview-and-export",
+    })
 }
 
 #[tauri::command]
@@ -235,6 +249,10 @@ async fn prepare_processed_preview(
             .map(|value| value.as_nanos())
             .unwrap_or(0);
         let mut hasher = DefaultHasher::new();
+        // Bump whenever rendering semantics change.  Without this, a cached
+        // preview made before EXIF normalization keeps showing stale fields.
+        const PREVIEW_RENDER_VERSION: u8 = 4;
+        PREVIEW_RENDER_VERSION.hash(&mut hasher);
         source.hash(&mut hasher);
         modified.hash(&mut hasher);
         template.hash(&mut hasher);
@@ -245,7 +263,8 @@ async fn prepare_processed_preview(
             .join("processed-preview");
         fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
         let target = cache.join(format!("{:016x}.jpg", hasher.finish()));
-        if !target.exists() {
+        let cache_hit = target.exists();
+        if !cache_hit {
             let preview = process_pipeline_preview_from_image(
                 &root,
                 &nodes,
@@ -255,7 +274,18 @@ async fn prepare_processed_preview(
             )?;
             save_image(&target, &preview, 75, 2)?;
         }
-        Ok(json!({"path":target}))
+        let (gpu_state, adapter) = gpu_acceleration_status();
+        Ok(json!({
+            "path": target,
+            "cache_hit": cache_hit,
+            "acceleration": {
+                "backend": if gpu_state == "validated" { "GPU (DX12 compute)" } else { "CPU" },
+                "state": gpu_state,
+                "adapter": adapter,
+                "pixel_exact": gpu_state == "validated",
+                "scope": "preview-and-export",
+            }
+        }))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -280,7 +310,11 @@ async fn start_processing(app: AppHandle, selected_items: Vec<String>) -> Result
         // Full-resolution blur templates retain multiple frame-sized buffers.
         // Keep batch parallelism bounded so several camera originals cannot
         // exhaust memory before the first export finishes.
-        let worker_count = selected_items.len().clamp(1, 2);
+        // A background-blur pipeline can retain several full-resolution and
+        // 2x-sized buffers. Running two D810 files concurrently pushes the
+        // process above 4 GB and causes paging, which is slower than serial
+        // GPU work on a single shared device.
+        let worker_count = 1;
         rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count)
             .build()
@@ -314,10 +348,14 @@ async fn start_processing(app: AppHandle, selected_items: Vec<String>) -> Result
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Validate the compute backend on a tiny deterministic image before any
+    // user preview/export so real photos never pay for CPU+GPU double work.
+    initialize_gpu_acceleration();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_config,
+            get_acceleration_status,
             save_config,
             list_files,
             get_template,

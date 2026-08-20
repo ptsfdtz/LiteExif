@@ -92,17 +92,18 @@ select:focus-visible,
   gap: 7px;
   font-size: 12px;
   color: var(--muted);
+  min-width: 128px;
+  justify-content: flex-end;
+  white-space: nowrap;
 }
-.engine-state > span {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #53a677;
-  box-shadow: 0 0 0 3px #53a67720;
+.engine-state > svg {
+  color: var(--success);
 }
-.engine-state.is-busy > span {
-  background: var(--signal);
-  box-shadow: 0 0 0 3px #df302725;
+.engine-state.is-busy > svg {
+  color: var(--signal);
+}
+.engine-state.has-error > svg {
+  color: var(--signal);
 }
 
 .workspace {

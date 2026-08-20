@@ -11,6 +11,7 @@ import {
   FileImage,
   FilePlus2,
   FolderOpen,
+  Gauge,
   ImageOff,
   Pencil,
   Play,
@@ -47,6 +48,14 @@ const emptyProgress: ProgressState = {
   message: "",
 };
 
+type AccelerationStatus = {
+  backend: string;
+  state: "pending" | "validated" | "disabled";
+  adapter: string | null;
+  pixel_exact: boolean;
+  scope: string;
+};
+
 function flattenFiles(nodes: FileNode[]): string[] {
   return nodes.flatMap((node) => node.is_file && node.value ? [node.value] : flattenFiles(node.children ?? []));
 }
@@ -68,6 +77,8 @@ export default function App() {
   const [progress, setProgress] = useState<ProgressState>(emptyProgress);
   const [dialog, setDialog] = useState<"create" | "saveAs" | null>(null);
   const [toast, setToast] = useState<{ text: string; kind: "success" | "error" } | null>(null);
+  const [acceleration, setAcceleration] = useState<AccelerationStatus | null>(null);
+  const [previewCacheHit, setPreviewCacheHit] = useState(false);
   const previewRequest = useRef(0);
 
   const notify = useCallback((text: string, kind: "success" | "error" = "success") => {
@@ -95,11 +106,15 @@ export default function App() {
     setSavedConfig(data);
   }, []);
 
+  const refreshAcceleration = useCallback(async () => {
+    setAcceleration(await invoke<AccelerationStatus>("get_acceleration_status"));
+  }, []);
+
   useEffect(() => {
-    Promise.all([loadConfig(), refreshFiles()])
+    Promise.all([loadConfig(), refreshFiles(), refreshAcceleration()])
       .catch((error) => notify(`初始化失败：${errorMessage(error)}`, "error"))
       .finally(() => setLoading(false));
-  }, [loadConfig, notify, refreshFiles]);
+  }, [loadConfig, notify, refreshAcceleration, refreshFiles]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -131,6 +146,7 @@ export default function App() {
     if (!node.value) return;
     const request = ++previewRequest.current;
     setPreviewLoading(true);
+    setPreviewCacheHit(false);
     try {
       const isHeic = /\.hei[cf]$/i.test(node.value);
       if (!isHeic) {
@@ -145,12 +161,14 @@ export default function App() {
       }
       if (!processed || request !== previewRequest.current) return;
 
-      const result = await invoke<{ path: string }>("prepare_processed_preview", {
+      const result = await invoke<{ path: string; cache_hit: boolean; acceleration: AccelerationStatus }>("prepare_processed_preview", {
         path: node.value,
         template,
       });
       if (request === previewRequest.current) {
         setPreview({ path: node.value, name: node.label, url: convertFileSrc(result.path) });
+        setPreviewCacheHit(result.cache_hit);
+        setAcceleration(result.acceleration);
       }
     } catch (error) {
       if (request === previewRequest.current) {
@@ -210,6 +228,7 @@ export default function App() {
     setProgress({ ...emptyProgress, active: true, total: selected.size, message: "准备处理" });
     try {
       await invoke("start_processing", { selectedItems: [...selected] });
+      await refreshAcceleration();
       await refreshFiles();
     } catch (error) {
       setProgress((value) => ({ ...value, active: false }));
@@ -228,8 +247,16 @@ export default function App() {
         <div className="brand-name">LiteExif</div>
         <div className="topbar-meta">2.1.5</div>
         <div className="topbar-spacer" />
-        <div className={`engine-state ${progress.active ? "is-busy" : ""}`}>
-          <span />{progress.active ? "正在导出" : "就绪"}
+        <div
+          className={`engine-state ${progress.active ? "is-busy" : ""} ${acceleration?.state === "disabled" ? "has-error" : ""}`}
+          title={acceleration?.adapter ?? "GPU 将在需要模糊计算时初始化"}
+        >
+          <Gauge size={14} />
+          {progress.active
+            ? "正在导出"
+            : acceleration?.state === "validated"
+              ? `DX12 · ${acceleration.adapter?.replace("NVIDIA GeForce ", "") ?? "GPU"}${previewCacheHit ? " · 缓存" : ""}`
+              : acceleration?.state === "disabled" ? "GPU 不可用 · CPU" : `GPU 待触发${previewCacheHit ? " · 缓存" : ""}`}
         </div>
       </header>
 

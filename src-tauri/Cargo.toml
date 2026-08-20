@@ -14,16 +14,19 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 ab_glyph = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 imageproc = "0.25"
 jpeg-encoder = "0.6"
 minijinja = { version = "2", features = ["builtins"] }
+pollster = "0.4"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 walkdir = "2"
+wgpu = { version = "26", default-features = false, features = ["dx12", "wgsl"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -32,3 +35,11 @@ windows = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
 ] }
+
+# `tauri dev` runs the debug profile. Image resizing and compositing are
+# unusably slow without optimization even though debug symbols are retained.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3

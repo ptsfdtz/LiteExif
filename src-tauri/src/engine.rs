@@ -3,6 +3,7 @@ use image::imageops::{self, FilterType};
 use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader, Rgba, RgbaImage};
 use imageproc::drawing::{draw_text_mut, text_size};
 use minijinja::{context, Environment, Error as TemplateError, State, Value as TemplateValue};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -10,6 +11,7 @@ use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use walkdir::WalkDir;
 
 pub type EngineResult<T> = Result<T, String>;
@@ -222,7 +224,35 @@ pub fn get_exif(root: &Path, path: &Path) -> HashMap<String, String> {
             result.insert(clean_key, clean_value);
         }
     }
+    normalize_exif_fields(&mut result);
     result
+}
+
+/// ExifTool exposes equivalent camera fields under different groups.  The
+/// bundled templates use the canonical names from the Python implementation,
+/// so populate those names when a camera only writes a maker-note variant.
+fn normalize_exif_fields(exif: &mut HashMap<String, String>) {
+    let populate = |exif: &mut HashMap<String, String>, canonical: &str, alternatives: &[&str]| {
+        if exif
+            .get(canonical)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return;
+        }
+        if let Some(value) = alternatives
+            .iter()
+            .filter_map(|key| exif.get(*key))
+            .find(|value| !value.trim().is_empty())
+            .cloned()
+        {
+            exif.insert(canonical.to_owned(), value);
+        }
+    };
+
+    populate(exif, "LensModel", &["Lens", "LensID", "LensType"]);
+    populate(exif, "CameraModelName", &["Model", "CameraModel"]);
+    populate(exif, "AperatureValue", &["ApertureValue", "FNumber"]);
+    populate(exif, "ShutterSpeed", &["ShutterSpeedValue", "ExposureTime"]);
 }
 
 fn template_number(state: &State<'_, '_>, key: &str) -> i64 {
@@ -457,12 +487,91 @@ fn resize_image(
         ),
         _ => image.dimensions(),
     };
-    imageops::resize(
-        image,
-        target_width.max(1),
-        target_height.max(1),
-        FilterType::Lanczos3,
-    )
+    resize_lanczos_parallel(image, target_width.max(1), target_height.max(1))
+}
+
+fn lanczos3_weight(x: f32) -> f32 {
+    fn sinc(value: f32) -> f32 {
+        let angle = value * std::f32::consts::PI;
+        if value == 0.0 {
+            1.0
+        } else {
+            angle.sin() / angle
+        }
+    }
+    if x.abs() < 3.0 {
+        sinc(x) * sinc(x / 3.0)
+    } else {
+        0.0
+    }
+}
+
+fn lanczos_weights(input: u32, output: u32) -> Vec<(usize, Vec<f32>)> {
+    let ratio = input as f32 / output as f32;
+    let scale_ratio = ratio.max(1.0);
+    let support = 3.0 * scale_ratio;
+    (0..output)
+        .map(|out| {
+            let center = (out as f32 + 0.5) * ratio;
+            let left = ((center - support).floor() as i64).clamp(0, input as i64 - 1);
+            let right = ((center + support).ceil() as i64).clamp(left + 1, input as i64);
+            let center = center - 0.5;
+            let mut weights: Vec<f32> = (left..right)
+                .map(|position| lanczos3_weight((position as f32 - center) / scale_ratio))
+                .collect();
+            let sum: f32 = weights.iter().sum();
+            weights.iter_mut().for_each(|weight| *weight /= sum);
+            (left as usize, weights)
+        })
+        .collect()
+}
+
+/// `image::imageops::resize` uses the same separable algorithm but processes
+/// the 100+ megapixel intermediate on one thread. Rows are independent; this
+/// keeps every per-pixel operation in the same order while distributing rows.
+fn resize_lanczos_parallel(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
+    if image.width() == width && image.height() == height {
+        return image.clone();
+    }
+    let source_width = image.width() as usize;
+    let target_width = width as usize;
+    let vertical_weights = lanczos_weights(image.height(), height);
+    let mut vertical = vec![0.0f32; source_width * height as usize * 4];
+    vertical
+        .par_chunks_mut(source_width * 4)
+        .enumerate()
+        .for_each(|(out_y, row)| {
+            let (top, weights) = &vertical_weights[out_y];
+            for x in 0..source_width {
+                for channel in 0..4 {
+                    let mut total = 0.0f32;
+                    for (offset, weight) in weights.iter().enumerate() {
+                        let index = ((top + offset) * source_width + x) * 4 + channel;
+                        total += image.as_raw()[index] as f32 * weight;
+                    }
+                    row[x * 4 + channel] = total;
+                }
+            }
+        });
+
+    let horizontal_weights = lanczos_weights(image.width(), width);
+    let mut output = vec![0u8; target_width * height as usize * 4];
+    output
+        .par_chunks_mut(target_width * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let source_row = &vertical[y * source_width * 4..(y + 1) * source_width * 4];
+            for (out_x, (left, weights)) in horizontal_weights.iter().enumerate() {
+                for channel in 0..4 {
+                    let mut total = 0.0f32;
+                    for (offset, weight) in weights.iter().enumerate() {
+                        total += source_row[(left + offset) * 4 + channel] * weight;
+                    }
+                    row[out_x * 4 + channel] = total.clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+    RgbaImage::from_raw(width, height, output).expect("parallel resize buffer has valid dimensions")
 }
 
 /// A three-pass box blur is the standard linear-time approximation of a
@@ -538,13 +647,89 @@ fn box_blur(image: &RgbaImage, radius: u32) -> RgbaImage {
     output
 }
 
-fn gaussian_blur(image: &RgbaImage, radius: i64) -> RgbaImage {
-    let radius = radius.max(0) as u32;
+fn gaussian_blur_cpu(image: &RgbaImage, radius: u32) -> RgbaImage {
     let mut output = image.clone();
     for _ in 0..3 {
         output = box_blur(&output, radius);
     }
     output
+}
+
+// GPU output is accepted only after a byte-for-byte comparison with the CPU
+// implementation. Both preview and export use this shared entry point.
+static GPU_BLUR_STATE: AtomicU8 = AtomicU8::new(0);
+static GPU_BLUR_VALIDATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+const GPU_VALIDATED: u8 = 1;
+const GPU_DISABLED: u8 = 2;
+
+fn gaussian_blur(image: &RgbaImage, radius: i64) -> RgbaImage {
+    let radius = radius.max(0) as u32;
+    if radius == 0 || image.width() == 0 || image.height() == 0 {
+        return image.clone();
+    }
+
+    // Dispatch overhead dominates tiny layers; camera-image backgrounds and
+    // their 512 px previews comfortably exceed this threshold.
+    let eligible = image.width() as u64 * image.height() as u64 >= 128 * 1024 && radius >= 2;
+    if !eligible || GPU_BLUR_STATE.load(Ordering::Acquire) == GPU_DISABLED {
+        return gaussian_blur_cpu(image, radius);
+    }
+
+    if GPU_BLUR_STATE.load(Ordering::Acquire) == GPU_VALIDATED || initialize_gpu_acceleration() {
+        return match crate::gpu::blur(image, radius) {
+            Ok((output, _)) => output,
+            Err(error) => {
+                eprintln!("LiteExif GPU blur disabled after runtime failure: {error}");
+                GPU_BLUR_STATE.store(GPU_DISABLED, Ordering::Release);
+                gaussian_blur_cpu(image, radius)
+            }
+        };
+    }
+
+    gaussian_blur_cpu(image, radius)
+}
+
+pub fn initialize_gpu_acceleration() -> bool {
+    *GPU_BLUR_VALIDATION.get_or_init(|| {
+        let mut source = RgbaImage::new(37, 23);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = Rgba([
+                ((x * 17 + y * 29) % 256) as u8,
+                ((x * x + y * 11) % 256) as u8,
+                ((x * 7 + y * y) % 256) as u8,
+                ((x * 13 + y * 19 + 31) % 256) as u8,
+            ]);
+        }
+        for radius in [1, 3, 9] {
+            let cpu = gaussian_blur_cpu(&source, radius);
+            match crate::gpu::blur(&source, radius) {
+                Ok((gpu, adapter)) if gpu.as_raw() == cpu.as_raw() => {
+                    eprintln!("LiteExif GPU blur check passed on {adapter}, radius {radius}");
+                }
+                Ok((_gpu, adapter)) => {
+                    eprintln!("LiteExif GPU blur disabled: output mismatch on {adapter}");
+                    GPU_BLUR_STATE.store(GPU_DISABLED, Ordering::Release);
+                    return false;
+                }
+                Err(error) => {
+                    eprintln!("LiteExif GPU blur unavailable; using CPU: {error}");
+                    GPU_BLUR_STATE.store(GPU_DISABLED, Ordering::Release);
+                    return false;
+                }
+            }
+        }
+        GPU_BLUR_STATE.store(GPU_VALIDATED, Ordering::Release);
+        true
+    })
+}
+
+pub fn gpu_acceleration_status() -> (&'static str, Option<&'static str>) {
+    let state = match GPU_BLUR_STATE.load(Ordering::Acquire) {
+        GPU_VALIDATED => "validated",
+        GPU_DISABLED => "disabled",
+        _ => "pending",
+    };
+    (state, crate::gpu::adapter_name())
 }
 
 fn foreground_bbox(
@@ -1377,6 +1562,7 @@ fn process_pipeline_with_source(
     let mut all_buffers = vec![vec![initial]];
     let mut last_merger: i64 = -1;
     for (index, node) in nodes.iter().enumerate() {
+        let node_started = std::time::Instant::now();
         let name = node
             .get("processor_name")
             .and_then(Value::as_str)
@@ -1427,6 +1613,11 @@ fn process_pipeline_with_source(
             output
         };
         output = process_node(root, node, input)?;
+        eprintln!(
+            "LiteExif node {index} {name}: {:?} ({} output image(s))",
+            node_started.elapsed(),
+            output.len()
+        );
         all_buffers.push(output.clone());
     }
     output
@@ -1574,6 +1765,27 @@ mod tests {
     }
 
     #[test]
+    fn maker_note_lens_is_available_to_standard_templates() {
+        let mut exif = HashMap::from([
+            ("Model".to_owned(), "NIKON D810".to_owned()),
+            ("Lens".to_owned(), "70-200mm f/2.8".to_owned()),
+            ("FNumber".to_owned(), "2.8".to_owned()),
+        ]);
+
+        normalize_exif_fields(&mut exif);
+
+        assert_eq!(
+            exif.get("LensModel").map(String::as_str),
+            Some("70-200mm f/2.8")
+        );
+        assert_eq!(
+            exif.get("CameraModelName").map(String::as_str),
+            Some("NIKON D810")
+        );
+        assert_eq!(exif.get("AperatureValue").map(String::as_str), Some("2.8"));
+    }
+
+    #[test]
     fn composition_uses_pillow_paste_semantics() {
         let mut canvas = RgbaImage::from_pixel(1, 1, Rgba([0, 100, 200, 128]));
         let source = RgbaImage::from_pixel(1, 1, Rgba([200, 30, 0, 64]));
@@ -1603,6 +1815,108 @@ mod tests {
 
         assert_eq!(output.dimensions(), source.dimensions());
         assert!(output.pixels().all(|pixel| pixel.0 == [17, 91, 203, 255]));
+    }
+
+    #[test]
+    fn gpu_blur_matches_cpu_byte_for_byte() {
+        let mut source = RgbaImage::new(37, 23);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = Rgba([
+                ((x * 17 + y * 29) % 256) as u8,
+                ((x * x + y * 11) % 256) as u8,
+                ((x * 7 + y * y) % 256) as u8,
+                ((x * 13 + y * 19 + 31) % 256) as u8,
+            ]);
+        }
+
+        for radius in [1, 3, 9] {
+            let cpu = gaussian_blur_cpu(&source, radius);
+            let (gpu, adapter) = crate::gpu::blur(&source, radius)
+                .unwrap_or_else(|error| panic!("GPU test could not run: {error}"));
+            assert_eq!(
+                gpu.as_raw(),
+                cpu.as_raw(),
+                "GPU mismatch on {adapter}, radius {radius}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_lanczos_matches_image_crate_byte_for_byte() {
+        let mut source = RgbaImage::new(37, 23);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = Rgba([
+                ((x * 17 + y * 29) % 256) as u8,
+                ((x * x + y * 11) % 256) as u8,
+                ((x * 7 + y * y) % 256) as u8,
+                ((x * 13 + y * 19 + 31) % 256) as u8,
+            ]);
+        }
+        for dimensions in [(74, 46), (51, 31), (19, 11), (13, 41)] {
+            let expected =
+                imageops::resize(&source, dimensions.0, dimensions.1, FilterType::Lanczos3);
+            let actual = resize_lanczos_parallel(&source, dimensions.0, dimensions.1);
+            assert_eq!(actual.as_raw(), expected.as_raw(), "size {dimensions:?}");
+        }
+    }
+
+    #[test]
+    fn preview_and_export_share_validated_gpu_blur() {
+        let root = project_root();
+        let source_path =
+            std::env::temp_dir().join(format!("liteexif-gpu-pipeline-{}.png", std::process::id()));
+        let mut source = RgbaImage::new(800, 1200);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = Rgba([
+                ((x * 3 + y * 5) % 256) as u8,
+                ((x * 7 + y * 11) % 256) as u8,
+                ((x * 13 + y * 17) % 256) as u8,
+                255,
+            ]);
+        }
+        save_image(&source_path, &source, 100, 0).unwrap();
+        let nodes = vec![json!({"processor_name": "blur", "blur_radius": 7})];
+
+        let preview =
+            process_pipeline_preview_from_image(&root, &nodes, &source_path, source.clone(), 512)
+                .unwrap();
+        assert_eq!(preview.height(), 512);
+        assert_eq!(gpu_acceleration_status().0, "validated");
+
+        let export = process_pipeline(&root, &nodes, &source_path).unwrap();
+        assert_eq!(export.dimensions(), source.dimensions());
+        assert_eq!(gpu_acceleration_status().0, "validated");
+        fs::remove_file(source_path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual full-frame GPU performance check"]
+    fn gpu_full_frame_performance() {
+        let source = RgbaImage::from_pixel(7360, 4912, Rgba([37, 91, 173, 255]));
+        let started = std::time::Instant::now();
+        let (_, adapter) = crate::gpu::blur(&source, 147).unwrap();
+        eprintln!("full-frame GPU blur on {adapter}: {:?}", started.elapsed());
+    }
+
+    #[test]
+    #[ignore = "set LITEEXIF_BENCH_IMAGE for a local full-pipeline measurement"]
+    fn actual_background_pipeline_performance() {
+        let source = std::env::var_os("LITEEXIF_BENCH_IMAGE")
+            .map(PathBuf::from)
+            .expect("LITEEXIF_BENCH_IMAGE is required");
+        let root = project_root();
+        let template = fs::read_to_string(root.join("config/templates/背景模糊.json")).unwrap();
+        let exif = get_exif(&root, &source);
+        let rendered = render_template(&root, &template, &exif, &source, &[]).unwrap();
+        let nodes: Vec<Value> = serde_json::from_str(&rendered).unwrap();
+        let started = std::time::Instant::now();
+        let output = process_pipeline(&root, &nodes, &source).unwrap();
+        eprintln!(
+            "actual background pipeline: {:?}, output {}x{}",
+            started.elapsed(),
+            output.width(),
+            output.height()
+        );
     }
 
     #[test]
