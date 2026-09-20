@@ -208,6 +208,15 @@ pub fn get_exif(root: &Path, path: &Path) -> HashMap<String, String> {
     parse_exif(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Keep template-relative dimensions in the same coordinate system as the
+/// decoded pixels. Cameras commonly store portrait JPEGs as landscape pixels
+/// plus an EXIF rotation, while `load_image` applies that rotation before the
+/// processing pipeline runs.
+pub fn normalize_exif_dimensions(exif: &mut HashMap<String, String>, image: &RgbaImage) {
+    exif.insert("ImageWidth".to_owned(), image.width().to_string());
+    exif.insert("ImageHeight".to_owned(), image.height().to_string());
+}
+
 fn parse_exif(text: &str) -> HashMap<String, String> {
     let mut result = HashMap::new();
     for line in text.lines() {
@@ -1435,13 +1444,17 @@ fn process_pipeline_with_source(
     unreachable!()
 }
 
-pub fn process_pipeline(
+pub fn process_pipeline_from_image(
     root: &Path,
     nodes: &[Value],
-    input_path: &Path,
+    initial: RgbaImage,
 ) -> EngineResult<RgbaImage> {
-    let initial = load_image(input_path)?;
     process_pipeline_with_source(root, nodes, initial)
+}
+
+#[cfg(test)]
+fn process_pipeline(root: &Path, nodes: &[Value], input_path: &Path) -> EngineResult<RgbaImage> {
+    process_pipeline_from_image(root, nodes, load_image(input_path)?)
 }
 
 pub fn process_pipeline_preview_from_image(
@@ -1646,6 +1659,20 @@ mod tests {
                 "2026-01-10 15:56:00".to_owned(),
             ),
         ])
+    }
+
+    #[test]
+    fn template_dimensions_follow_oriented_pixels() {
+        let mut exif = HashMap::from([
+            ("ImageWidth".to_owned(), "6000".to_owned()),
+            ("ImageHeight".to_owned(), "4000".to_owned()),
+        ]);
+        let portrait = RgbaImage::new(4000, 6000);
+
+        normalize_exif_dimensions(&mut exif, &portrait);
+
+        assert_eq!(exif.get("ImageWidth").map(String::as_str), Some("4000"));
+        assert_eq!(exif.get("ImageHeight").map(String::as_str), Some("6000"));
     }
 
     #[test]

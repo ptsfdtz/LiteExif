@@ -15,6 +15,7 @@ interface Props {
   previewPath?: string;
   onSelectionChange?: (paths: string[], selected: boolean) => void;
   onPreview: (node: FileNode) => void;
+  onContextMenu?: (node: FileNode, x: number, y: number) => void;
 }
 
 function collectFiles(node: FileNode): string[] {
@@ -30,6 +31,7 @@ function TreeRow({
   previewPath,
   onSelectionChange,
   onPreview,
+  onContextMenu,
 }: Props & { node: FileNode; depth: number }) {
   const [expanded, setExpanded] = useState(depth < 1);
   const paths = useMemo(() => collectFiles(node), [node]);
@@ -48,6 +50,12 @@ function TreeRow({
       <div
         className={`tree-row ${previewPath === node.value ? "is-previewing" : ""}`}
         style={{ paddingInlineStart: `${10 + depth * 16}px` }}
+        onContextMenu={(event) => {
+          if (!node.value || !onContextMenu) return;
+          event.preventDefault();
+          event.stopPropagation();
+          onContextMenu(node, event.clientX, event.clientY);
+        }}
       >
         {isFolder ? (
           <button
@@ -102,6 +110,7 @@ function TreeRow({
             previewPath={previewPath}
             onSelectionChange={onSelectionChange}
             onPreview={onPreview}
+            onContextMenu={onContextMenu}
           />
         ))}
     </div>

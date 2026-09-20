@@ -5,8 +5,9 @@ mod text;
 
 use engine::{
     copy_runtime_resources, get_exif, gpu_acceleration_status, initialize_gpu_acceleration,
-    list_files as scan_files, list_templates, load_image, process_pipeline,
-    process_pipeline_preview_from_image, render_template, save_image, IniConfig,
+    list_files as scan_files, list_templates, load_image, normalize_exif_dimensions,
+    process_pipeline_from_image, process_pipeline_preview_from_image, render_template, save_image,
+    IniConfig,
 };
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
@@ -164,6 +165,66 @@ fn create_template(
 }
 
 #[tauri::command]
+fn delete_file(app: AppHandle, path: String) -> Result<Value, String> {
+    let root = runtime_root(&app)?;
+    let config = load_config(&root)?;
+    let input = PathBuf::from(config.get("DEFAULT", "input_folder")?);
+    let output = PathBuf::from(config.get("DEFAULT", "output_folder")?);
+    let target = PathBuf::from(path);
+    if !target.is_file() {
+        return Err("只能删除文件".to_owned());
+    }
+    // Guard against deleting arbitrary paths through forged requests.
+    let inside = |base: &PathBuf| !base.as_os_str().is_empty() && target.starts_with(base);
+    if !(inside(&input) || inside(&output)) {
+        return Err("只能删除输入/输出目录下的文件".to_owned());
+    }
+    trash::delete(&target).map_err(|error| error.to_string())?;
+    Ok(json!({"message":"已移入回收站"}))
+}
+
+#[tauri::command]
+fn reveal_in_folder(path: String) -> Result<Value, String> {
+    let target = PathBuf::from(path);
+    if !target.exists() {
+        return Err("路径不存在".to_owned());
+    }
+    #[cfg(windows)]
+    {
+        let display = target.to_string_lossy().into_owned();
+        let mut command = std::process::Command::new("explorer");
+        if target.is_file() {
+            command.args(["/select,", display.as_str()]);
+        } else {
+            command.arg(display.as_str());
+        }
+        command.spawn().map_err(|error| error.to_string())?;
+        return Ok(json!({"message":"已打开所在位置"}));
+    }
+    #[cfg(not(windows))]
+    {
+        return Err("当前平台不支持打开所在位置".to_owned());
+    }
+}
+
+#[tauri::command]
+fn set_active_template(app: AppHandle, template_name: String) -> Result<Value, String> {
+    let root = runtime_root(&app)?;
+    // 模板切换必须立即落盘：导出时后端只认 config.ini 里的 template_name，
+    // 否则预览和导出会用两套不同的模板。
+    let target = root
+        .join("config/templates")
+        .join(format!("{template_name}.json"));
+    if !target.is_file() {
+        return Err(format!("模板不存在: {template_name}"));
+    }
+    let mut config = load_config(&root)?;
+    config.set("render", "template_name", template_name);
+    config.save(&root.join("config/config.ini"))?;
+    Ok(json!({"message":"已切换模板"}))
+}
+
+#[tauri::command]
 fn prepare_preview(app: AppHandle, path: String) -> Result<Value, String> {
     let source = PathBuf::from(path);
     if !source.is_file() {
@@ -228,7 +289,7 @@ async fn prepare_processed_preview(
         let mut hasher = DefaultHasher::new();
         // Bump whenever rendering semantics change.  Without this, a cached
         // preview made before EXIF normalization keeps showing stale fields.
-        const PREVIEW_RENDER_VERSION: u8 = 6;
+        const PREVIEW_RENDER_VERSION: u8 = 7;
         PREVIEW_RENDER_VERSION.hash(&mut hasher);
         source.hash(&mut hasher);
         modified.hash(&mut hasher);
@@ -259,8 +320,9 @@ async fn prepare_processed_preview(
             if PREVIEW_SEQUENCE.load(Ordering::Relaxed) != sequence {
                 return Err("预览请求已更新".to_owned());
             }
-            let exif = get_exif(&root, &source);
             let original = load_image(&source)?;
+            let mut exif = get_exif(&root, &source);
+            normalize_exif_dimensions(&mut exif, &original);
             let rendered = render_template(&root, &template, &exif, &source, &[])?;
             let nodes: Vec<Value> = serde_json::from_str(&rendered)
                 .map_err(|error| format!("模板渲染结果无效: {error}"))?;
@@ -317,11 +379,13 @@ async fn start_processing(app: AppHandle, selected_items: Vec<String>) -> Result
             let status = if target.exists() && !overwrite { skipped.fetch_add(1, Ordering::Relaxed); "skipped" }
             else {
                 let result = (|| -> Result<(), String> {
-                    let exif = get_exif(&root, &source);
+                    let original = load_image(&source)?;
+                    let mut exif = get_exif(&root, &source);
+                    normalize_exif_dimensions(&mut exif, &original);
                     let rendered = render_template(&root, &template_source, &exif, &source, &selected_items)?;
                     let nodes: Vec<Value> = serde_json::from_str(&rendered).map_err(|error| format!("模板渲染结果无效: {error}"))?;
                     let _render_guard = RENDER_LOCK.lock().map_err(|error| error.to_string())?;
-                    let output = process_pipeline(&root, &nodes, &source)?;
+                    let output = process_pipeline_from_image(&root, &nodes, original)?;
                     save_image(&target, &output, quality, subsampling)
                 })();
                 if result.is_ok() { success.fetch_add(1, Ordering::Relaxed); "success" } else { failure.fetch_add(1, Ordering::Relaxed); "failure" }
@@ -350,6 +414,9 @@ pub fn run() {
             list_files,
             get_template,
             create_template,
+            set_active_template,
+            delete_file,
+            reveal_in_folder,
             prepare_preview,
             prepare_processed_preview,
             start_processing,
