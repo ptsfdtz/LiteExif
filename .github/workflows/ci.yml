@@ -75,6 +75,10 @@ jobs:
       - name: Verify application version
         run: pnpm version:check
 
+      - name: Fetch ExifTool
+        shell: pwsh
+        run: ./scripts/fetch-exiftool.ps1
+
       - name: Run tests
         run: cargo test --locked --lib
         working-directory: src-tauri

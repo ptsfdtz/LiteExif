@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "desktop:build": "npm run tauri build",
-    "version:check": "node scripts/check-version.mjs"
+    "version:check": "node scripts/check-version.mjs",
+    "version:set": "node scripts/set-version.mjs"
   },
   "dependencies": {
     "@codemirror/lang-json": "^6.0.2",

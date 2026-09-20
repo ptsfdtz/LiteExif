@@ -32,7 +32,13 @@ if (uniqueVersions.size !== 1) {
 }
 
 const version = packageJson.version;
-if (process.env.GITHUB_REF_TYPE === 'tag' && process.env.GITHUB_REF_NAME !== `v${version}`) {
+// The release workflow syncs the version from the tag before verifying, so the
+// tag-match check is opt-in and never blocks the regular CI run.
+if (
+  process.env.CHECK_RELEASE_TAG === '1' &&
+  process.env.GITHUB_REF_TYPE === 'tag' &&
+  process.env.GITHUB_REF_NAME !== `v${version}`
+) {
   throw new Error(`Release tag ${process.env.GITHUB_REF_NAME} does not match v${version}.`);
 }
 

@@ -62,14 +62,18 @@ pnpm desktop:build
 
 ## 发布与自动更新
 
-推送 `v*` 形式的标签会触发 `.github/workflows/release.yml`：先运行 CI 校验，然后在 Windows runner 上构建 NSIS 安装包并自动创建或更新对应的 GitHub Release（含 Tauri 更新产物与 `latest.json`）。
+推送 `v*` 形式的标签会触发 `.github/workflows/release.yml`：先运行 CI 校验，再按标签自动同步 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 的版本号，然后在 Windows runner 上构建 NSIS 安装包并自动创建或更新对应的 GitHub Release（含 Tauri 更新产物与 `latest.json`）。
 
 ```powershell
-# 1. 同步版本号（package.json、src-tauri/tauri.conf.json、src-tauri/Cargo.toml 必须一致）
-pnpm version:check
-# 2. 打标签并推送
 git tag v0.2.0
 git push origin v0.2.0
+```
+
+本地也可以手动同步与校验版本号：
+
+```powershell
+pnpm version:set 0.2.0
+pnpm version:check
 ```
 
 仓库需要在 GitHub Secrets 中配置 Tauri 更新签名私钥（与 LiteMark 共用同一把密钥）：

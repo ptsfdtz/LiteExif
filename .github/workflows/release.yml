@@ -56,8 +56,17 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch-exiftool.ps1
 
+      - name: Sync version from tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          node scripts/set-version.mjs $version
+
       - name: Verify application version
         run: pnpm version:check
+        env:
+          CHECK_RELEASE_TAG: "1"
 
       - name: Build and publish release
         uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
