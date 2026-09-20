@@ -1,0 +1,18 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="liteexif-mark" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#23262b" />
+      <stop offset="1" stop-color="#4a4f57" />
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="273" fill="url(#liteexif-mark)" />
+  <g transform="translate(512 512) scale(30.5) translate(-12 -12)" stroke="#ffffff" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="10" />
+    <line x1="14.31" y1="8" x2="20.05" y2="17.94" />
+    <line x1="9.69" y1="8" x2="21.17" y2="8" />
+    <line x1="7.38" y1="12" x2="13.12" y2="2.06" />
+    <line x1="9.69" y1="16" x2="3.95" y2="6.06" />
+    <line x1="14.31" y1="16" x2="2.83" y2="16" />
+    <line x1="16.62" y1="12" x2="10.88" y2="21.94" />
+  </g>
+</svg>

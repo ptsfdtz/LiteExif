@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "liteexif"
-version = "2.1.5"
+version = "0.1.0"
 dependencies = [
  "bytemuck",
  "freetype-rs",

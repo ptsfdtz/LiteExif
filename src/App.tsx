@@ -328,7 +328,7 @@ export default function App() {
         >
           <div className="brand-mark"><Aperture size={20} strokeWidth={2.3} /></div>
           <div className="brand-name">LiteExif</div>
-          <div className="topbar-meta">2.1.5</div>
+          <div className="topbar-meta">{__APP_VERSION__}</div>
         </div>
         <div className="topbar-spacer" data-tauri-drag-region onDoubleClick={toggleWindowMaximize} />
         <div
