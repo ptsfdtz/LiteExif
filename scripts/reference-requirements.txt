@@ -1,0 +1,7 @@
+# Development-only oracle, matching the cloned semi-utils uv.lock.
+Pillow==12.1.0
+numpy==2.4.0
+Jinja2==3.1.6
+pillow-heif==1.1.1
+loguru==0.7.3
+tomli==2.3.0

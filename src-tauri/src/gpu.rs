@@ -9,6 +9,9 @@ struct Params {
     height: u32,
     radius: u32,
     horizontal: u32,
+    weight: u32,
+    fringe: u32,
+    padding: vec2<u32>,
 }
 
 @group(0) @binding(0) var<storage, read> source: array<u32>;
@@ -40,8 +43,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             channel(pixel, 0u), channel(pixel, 8u),
             channel(pixel, 16u), channel(pixel, 24u));
     }
-    let divisor = params.radius * 2u + 1u;
-    let rounded = (sums + vec4<u32>(divisor / 2u)) / vec4<u32>(divisor);
+    var edges = vec4<u32>(0u);
+    for (var side = -1; side <= 1; side = side + 2) {
+        var sx = i32(x);
+        var sy = i32(y);
+        if (params.horizontal != 0u) {
+            sx = clamp(sx + side * (r + 1), 0, i32(params.width) - 1);
+        } else {
+            sy = clamp(sy + side * (r + 1), 0, i32(params.height) - 1);
+        }
+        let p = source[u32(sy) * params.width + u32(sx)];
+        edges = edges + vec4<u32>(channel(p,0u), channel(p,8u), channel(p,16u), channel(p,24u));
+    }
+    let rounded = (sums * params.weight + edges * params.fringe + vec4<u32>(1u << 23u)) >> vec4<u32>(24u);
     destination[index] = rounded.x | (rounded.y << 8u) |
         (rounded.z << 16u) | (rounded.w << 24u);
 }
@@ -54,6 +68,9 @@ struct Params {
     height: u32,
     radius: u32,
     horizontal: u32,
+    weight: u32,
+    fringe: u32,
+    padding: [u32; 2],
 }
 
 struct GpuBlur {
@@ -154,7 +171,11 @@ impl GpuBlur {
     }
 
     fn blur(&self, image: &RgbaImage, radius: u32) -> Result<RgbaImage, String> {
+        let (radius, weight, fringe) = crate::raster::blur_parameters(radius);
         let byte_len = image.as_raw().len() as u64;
+        if byte_len > self.device.limits().max_storage_buffer_binding_size as u64 {
+            return Err("图像超过 GPU 缓冲区限制".to_owned());
+        }
         let buffer_a = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -185,7 +206,11 @@ impl GpuBlur {
                 width: image.width(),
                 height: image.height(),
                 radius,
-                horizontal: u32::from(pass_index % 2 == 0),
+                // Pillow runs three horizontal passes, then three vertical.
+                horizontal: u32::from(pass_index < 3),
+                weight,
+                fringe,
+                padding: [0; 2],
             };
             let uniform = self
                 .device

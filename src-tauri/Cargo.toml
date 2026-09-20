@@ -13,12 +13,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-ab_glyph = "0.2"
+freetype-rs = "0.36"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-imageproc = "0.25"
 jpeg-encoder = "0.6"
 minijinja = { version = "2", features = ["builtins"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 pollster = "0.4"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

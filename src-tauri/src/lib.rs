@@ -1,12 +1,13 @@
 mod engine;
 mod gpu;
+mod raster;
+mod text;
 
 use engine::{
     copy_runtime_resources, get_exif, gpu_acceleration_status, initialize_gpu_acceleration,
     list_files as scan_files, list_templates, load_image, process_pipeline,
     process_pipeline_preview_from_image, render_template, save_image, IniConfig,
 };
-use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -14,6 +15,10 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
+
+// Full-resolution previews and exports share the same memory budget.
+static RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PREVIEW_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 fn runtime_root(app: &AppHandle) -> Result<PathBuf, String> {
     if cfg!(debug_assertions) {
@@ -203,6 +208,7 @@ async fn prepare_processed_preview(
     path: String,
     template: String,
 ) -> Result<Value, String> {
+    let sequence = PREVIEW_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     tauri::async_runtime::spawn_blocking(move || {
         let root = runtime_root(&app)?;
         let source = PathBuf::from(path);
@@ -210,36 +216,7 @@ async fn prepare_processed_preview(
             return Err("图片不存在".to_owned());
         }
 
-        let mut exif = get_exif(&root, &source);
-        let original = load_image(&source)?;
-        let largest_side = original.width().max(original.height());
-        // A preview should be quick and fit the preview surface.  Rendering a
-        // 1600px source with a large blur radius can consume gigabytes before
-        // the user sees anything, especially for portrait photographs.
-        const PREVIEW_MAX_DIMENSION: u32 = 512;
-        let scale = if largest_side > PREVIEW_MAX_DIMENSION {
-            PREVIEW_MAX_DIMENSION as f64 / largest_side as f64
-        } else {
-            1.0
-        };
-        // The Python implementation renders vw/vh from ExifTool's original
-        // dimensions, then applies EXIF orientation while decoding pixels.
-        // Do not replace them with the oriented dimensions here: that swaps
-        // template geometry for portrait photos carrying an orientation tag.
-        let exif_dimension = |key: &str, fallback: u32| {
-            exif.get(key)
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(fallback)
-        };
-        let preview_exif_width =
-            (exif_dimension("ImageWidth", original.width()) as f64 * scale) as u32;
-        let preview_exif_height =
-            (exif_dimension("ImageHeight", original.height()) as f64 * scale) as u32;
-        exif.insert("ImageWidth".to_owned(), preview_exif_width.to_string());
-        exif.insert("ImageHeight".to_owned(), preview_exif_height.to_string());
-        let rendered = render_template(&root, &template, &exif, &source, &[])?;
-        let nodes: Vec<Value> = serde_json::from_str(&rendered)
-            .map_err(|error| format!("模板渲染结果无效: {error}"))?;
+        const PREVIEW_MAX_DIMENSION: u32 = 1600;
 
         let modified = source
             .metadata()
@@ -251,20 +228,42 @@ async fn prepare_processed_preview(
         let mut hasher = DefaultHasher::new();
         // Bump whenever rendering semantics change.  Without this, a cached
         // preview made before EXIF normalization keeps showing stale fields.
-        const PREVIEW_RENDER_VERSION: u8 = 4;
+        const PREVIEW_RENDER_VERSION: u8 = 6;
         PREVIEW_RENDER_VERSION.hash(&mut hasher);
         source.hash(&mut hasher);
         modified.hash(&mut hasher);
         template.hash(&mut hasher);
+        // Font/Logo edits also change the final image, even with the same JSON.
+        for directory in ["config/fonts", "config/logos"] {
+            for entry in walkdir::WalkDir::new(root.join(directory))
+                .into_iter()
+                .flatten()
+            {
+                entry.path().hash(&mut hasher);
+                if let Ok(metadata) = entry.metadata() {
+                    metadata.len().hash(&mut hasher);
+                    metadata.modified().ok().hash(&mut hasher);
+                }
+            }
+        }
         let cache = app
             .path()
             .app_cache_dir()
             .map_err(|error| error.to_string())?
             .join("processed-preview");
         fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-        let target = cache.join(format!("{:016x}.jpg", hasher.finish()));
+        let target = cache.join(format!("{:016x}.png", hasher.finish()));
         let cache_hit = target.exists();
         if !cache_hit {
+            let _render_guard = RENDER_LOCK.lock().map_err(|error| error.to_string())?;
+            if PREVIEW_SEQUENCE.load(Ordering::Relaxed) != sequence {
+                return Err("预览请求已更新".to_owned());
+            }
+            let exif = get_exif(&root, &source);
+            let original = load_image(&source)?;
+            let rendered = render_template(&root, &template, &exif, &source, &[])?;
+            let nodes: Vec<Value> = serde_json::from_str(&rendered)
+                .map_err(|error| format!("模板渲染结果无效: {error}"))?;
             let preview = process_pipeline_preview_from_image(
                 &root,
                 &nodes,
@@ -272,7 +271,7 @@ async fn prepare_processed_preview(
                 original,
                 PREVIEW_MAX_DIMENSION,
             )?;
-            save_image(&target, &preview, 75, 2)?;
+            save_image(&target, &preview, 100, 0)?;
         }
         let (gpu_state, adapter) = gpu_acceleration_status();
         Ok(json!({
@@ -307,19 +306,9 @@ async fn start_processing(app: AppHandle, selected_items: Vec<String>) -> Result
         let processed = AtomicUsize::new(0); let success = AtomicUsize::new(0); let failure = AtomicUsize::new(0); let skipped = AtomicUsize::new(0);
         app.emit("processing-progress", json!({"event":"start","data":{"total":total,"processed":0,"success":0,"failure":0,"skipped":0,"percent":0,"message":format!("开始处理 {total} 个文件")}})).map_err(|error| error.to_string())?;
 
-        // Full-resolution blur templates retain multiple frame-sized buffers.
-        // Keep batch parallelism bounded so several camera originals cannot
-        // exhaust memory before the first export finishes.
-        // A background-blur pipeline can retain several full-resolution and
-        // 2x-sized buffers. Running two D810 files concurrently pushes the
-        // process above 4 GB and causes paging, which is slower than serial
-        // GPU work on a single shared device.
-        let worker_count = 1;
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(worker_count)
-            .build()
-            .map_err(|error| error.to_string())?
-            .install(|| selected_items.par_iter().for_each(|item| {
+        // Process photos sequentially to bound frame memory. Image kernels use
+        // the global Rayon pool; a one-thread batch pool would serialize them.
+        selected_items.iter().for_each(|item| {
             let source = PathBuf::from(item);
             let name = source.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let relative = source.strip_prefix(&input_root).unwrap_or(&source);
@@ -331,6 +320,7 @@ async fn start_processing(app: AppHandle, selected_items: Vec<String>) -> Result
                     let exif = get_exif(&root, &source);
                     let rendered = render_template(&root, &template_source, &exif, &source, &selected_items)?;
                     let nodes: Vec<Value> = serde_json::from_str(&rendered).map_err(|error| format!("模板渲染结果无效: {error}"))?;
+                    let _render_guard = RENDER_LOCK.lock().map_err(|error| error.to_string())?;
                     let output = process_pipeline(&root, &nodes, &source)?;
                     save_image(&target, &output, quality, subsampling)
                 })();
@@ -339,7 +329,7 @@ async fn start_processing(app: AppHandle, selected_items: Vec<String>) -> Result
             let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
             let labels = match status { "success"=>"完成", "skipped"=>"跳过", _=>"失败" };
             let _ = app.emit("processing-progress", json!({"event":"progress","data":{"total":total,"processed":done,"success":success.load(Ordering::Relaxed),"failure":failure.load(Ordering::Relaxed),"skipped":skipped.load(Ordering::Relaxed),"current":name,"percent":if total==0{100}else{done*100/total},"message":format!("{labels}: {name}")}}));
-        }));
+        });
         let result = json!({"total":total,"processed":processed.load(Ordering::Relaxed),"success":success.load(Ordering::Relaxed),"failure":failure.load(Ordering::Relaxed),"skipped":skipped.load(Ordering::Relaxed),"percent":100,"message":format!("处理完成：成功 {}，跳过 {}，失败 {}",success.load(Ordering::Relaxed),skipped.load(Ordering::Relaxed),failure.load(Ordering::Relaxed))});
         app.emit("processing-progress", json!({"event":"complete","data":result})).map_err(|error| error.to_string())?;
         Ok(result)

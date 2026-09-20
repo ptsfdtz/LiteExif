@@ -10,3 +10,6 @@ node_modules
 logs
 tmp
 src-tauri/target
+.venv-renderer
+__pycache__
+*.pyc

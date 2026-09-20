@@ -35,7 +35,9 @@
     "icon": ["../static/logo.ico"],
     "resources": {
       "../config": "config",
-      "../exiftool": "exiftool"
+      "../exiftool": "exiftool",
+      "../licenses": "licenses",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
     }
   }
 }

@@ -1,9 +1,6 @@
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
-use image::imageops::{self, FilterType};
+use image::imageops;
 use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader, Rgba, RgbaImage};
-use imageproc::drawing::{draw_text_mut, text_size};
 use minijinja::{context, Environment, Error as TemplateError, State, Value as TemplateValue};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -201,15 +198,18 @@ pub fn list_templates(root: &Path) -> Vec<String> {
 
 pub fn get_exif(root: &Path, path: &Path) -> HashMap<String, String> {
     let executable = root.join("exiftool/exiftool.exe");
-    let mut result = HashMap::new();
     let Ok(output) = Command::new(executable)
         .args(["-d", "%Y-%m-%d %H:%M:%S%3f%z"])
         .arg(path)
         .output()
     else {
-        return result;
+        return HashMap::new();
     };
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_exif(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_exif(text: &str) -> HashMap<String, String> {
+    let mut result = HashMap::new();
     for line in text.lines() {
         if let Some((key, value)) = line.split_once(':') {
             let clean_key = key
@@ -224,35 +224,9 @@ pub fn get_exif(root: &Path, path: &Path) -> HashMap<String, String> {
             result.insert(clean_key, clean_value);
         }
     }
-    normalize_exif_fields(&mut result);
+    // Preserve upstream field names and missing values. Inventing aliases
+    // changes the visible watermark for cameras with incomplete EXIF.
     result
-}
-
-/// ExifTool exposes equivalent camera fields under different groups.  The
-/// bundled templates use the canonical names from the Python implementation,
-/// so populate those names when a camera only writes a maker-note variant.
-fn normalize_exif_fields(exif: &mut HashMap<String, String>) {
-    let populate = |exif: &mut HashMap<String, String>, canonical: &str, alternatives: &[&str]| {
-        if exif
-            .get(canonical)
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            return;
-        }
-        if let Some(value) = alternatives
-            .iter()
-            .filter_map(|key| exif.get(*key))
-            .find(|value| !value.trim().is_empty())
-            .cloned()
-        {
-            exif.insert(canonical.to_owned(), value);
-        }
-    };
-
-    populate(exif, "LensModel", &["Lens", "LensID", "LensType"]);
-    populate(exif, "CameraModelName", &["Model", "CameraModel"]);
-    populate(exif, "AperatureValue", &["ApertureValue", "FNumber"]);
-    populate(exif, "ShutterSpeed", &["ShutterSpeedValue", "ExposureTime"]);
 }
 
 fn template_number(state: &State<'_, '_>, key: &str) -> i64 {
@@ -276,6 +250,25 @@ pub fn render_template(
     files: &[String],
 ) -> EngineResult<String> {
     let mut environment = Environment::new();
+    environment.set_unknown_method_callback(|state, value, method, args| {
+        if let (Some(text), "partition") = (value.as_str(), method) {
+            let (separator,): (&str,) = minijinja::value::from_args(args)?;
+            if separator.is_empty() {
+                return Err(TemplateError::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    "empty separator",
+                ));
+            }
+            let parts = match text.split_once(separator) {
+                Some((left, right)) => vec![left, separator, right],
+                None => vec![text, "", ""],
+            };
+            return Ok(TemplateValue::from(
+                parts.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            ));
+        }
+        minijinja_contrib::pycompat::unknown_method_callback(state, value, method, args)
+    });
     environment.add_function("vw", |state: &State<'_, '_>, percent: f64| -> i64 {
         (template_number(state, "ImageWidth") as f64 * percent / 100.0) as i64
     });
@@ -473,14 +466,20 @@ fn resize_image(
 ) -> RgbaImage {
     let (target_width, target_height) = match (width, height, scale) {
         (Some(w), Some(h), _) => (w, h),
-        (Some(w), None, _) => (
-            w,
-            (image.height() as f64 * w as f64 / image.width() as f64) as u32,
-        ),
-        (None, Some(h), _) => (
-            (image.width() as f64 * h as f64 / image.height() as f64) as u32,
-            h,
-        ),
+        (Some(w), None, _) => {
+            let factor = w as f64 / image.width() as f64;
+            (
+                (image.width() as f64 * factor) as u32,
+                (image.height() as f64 * factor) as u32,
+            )
+        }
+        (None, Some(h), _) => {
+            let factor = h as f64 / image.height() as f64;
+            (
+                (image.width() as f64 * factor) as u32,
+                (image.height() as f64 * factor) as u32,
+            )
+        }
         (_, _, Some(factor)) => (
             (image.width() as f64 * factor) as u32,
             (image.height() as f64 * factor) as u32,
@@ -490,169 +489,12 @@ fn resize_image(
     resize_lanczos_parallel(image, target_width.max(1), target_height.max(1))
 }
 
-fn lanczos3_weight(x: f32) -> f32 {
-    fn sinc(value: f32) -> f32 {
-        let angle = value * std::f32::consts::PI;
-        if value == 0.0 {
-            1.0
-        } else {
-            angle.sin() / angle
-        }
-    }
-    if x.abs() < 3.0 {
-        sinc(x) * sinc(x / 3.0)
-    } else {
-        0.0
-    }
-}
-
-fn lanczos_weights(input: u32, output: u32) -> Vec<(usize, Vec<f32>)> {
-    let ratio = input as f32 / output as f32;
-    let scale_ratio = ratio.max(1.0);
-    let support = 3.0 * scale_ratio;
-    (0..output)
-        .map(|out| {
-            let center = (out as f32 + 0.5) * ratio;
-            let left = ((center - support).floor() as i64).clamp(0, input as i64 - 1);
-            let right = ((center + support).ceil() as i64).clamp(left + 1, input as i64);
-            let center = center - 0.5;
-            let mut weights: Vec<f32> = (left..right)
-                .map(|position| lanczos3_weight((position as f32 - center) / scale_ratio))
-                .collect();
-            let sum: f32 = weights.iter().sum();
-            weights.iter_mut().for_each(|weight| *weight /= sum);
-            (left as usize, weights)
-        })
-        .collect()
-}
-
-/// `image::imageops::resize` uses the same separable algorithm but processes
-/// the 100+ megapixel intermediate on one thread. Rows are independent; this
-/// keeps every per-pixel operation in the same order while distributing rows.
 fn resize_lanczos_parallel(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
-    if image.width() == width && image.height() == height {
-        return image.clone();
-    }
-    let source_width = image.width() as usize;
-    let target_width = width as usize;
-    let vertical_weights = lanczos_weights(image.height(), height);
-    let mut vertical = vec![0.0f32; source_width * height as usize * 4];
-    vertical
-        .par_chunks_mut(source_width * 4)
-        .enumerate()
-        .for_each(|(out_y, row)| {
-            let (top, weights) = &vertical_weights[out_y];
-            for x in 0..source_width {
-                for channel in 0..4 {
-                    let mut total = 0.0f32;
-                    for (offset, weight) in weights.iter().enumerate() {
-                        let index = ((top + offset) * source_width + x) * 4 + channel;
-                        total += image.as_raw()[index] as f32 * weight;
-                    }
-                    row[x * 4 + channel] = total;
-                }
-            }
-        });
-
-    let horizontal_weights = lanczos_weights(image.width(), width);
-    let mut output = vec![0u8; target_width * height as usize * 4];
-    output
-        .par_chunks_mut(target_width * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let source_row = &vertical[y * source_width * 4..(y + 1) * source_width * 4];
-            for (out_x, (left, weights)) in horizontal_weights.iter().enumerate() {
-                for channel in 0..4 {
-                    let mut total = 0.0f32;
-                    for (offset, weight) in weights.iter().enumerate() {
-                        total += source_row[(left + offset) * 4 + channel] * weight;
-                    }
-                    row[out_x * 4 + channel] = total.clamp(0.0, 255.0).round() as u8;
-                }
-            }
-        });
-    RgbaImage::from_raw(width, height, output).expect("parallel resize buffer has valid dimensions")
-}
-
-/// A three-pass box blur is the standard linear-time approximation of a
-/// Gaussian blur.  `imageops::blur` becomes prohibitively expensive for the
-/// large radii generated by `vh(3)` on full-resolution camera files.
-fn box_blur(image: &RgbaImage, radius: u32) -> RgbaImage {
-    if radius == 0 || image.width() == 0 || image.height() == 0 {
-        return image.clone();
-    }
-
-    let width = image.width() as usize;
-    let height = image.height() as usize;
-    let radius = radius as usize;
-    let kernel = (radius * 2 + 1) as u32;
-    let mut horizontal = RgbaImage::new(image.width(), image.height());
-
-    for y in 0..height {
-        let mut sums = [0u32; 4];
-        for offset in 0..=radius {
-            let pixel = image.get_pixel(offset.min(width - 1) as u32, y as u32).0;
-            let copies = if offset == 0 { radius + 1 } else { 1 };
-            for channel in 0..4 {
-                sums[channel] += pixel[channel] as u32 * copies as u32;
-            }
-        }
-        for x in 0..width {
-            let mut output = [0u8; 4];
-            for channel in 0..4 {
-                output[channel] = ((sums[channel] + kernel / 2) / kernel) as u8;
-            }
-            horizontal.put_pixel(x as u32, y as u32, Rgba(output));
-
-            let leaving = image.get_pixel(x.saturating_sub(radius) as u32, y as u32).0;
-            let entering = image
-                .get_pixel((x + radius + 1).min(width - 1) as u32, y as u32)
-                .0;
-            for channel in 0..4 {
-                sums[channel] = sums[channel] + entering[channel] as u32 - leaving[channel] as u32;
-            }
-        }
-    }
-
-    let mut output = RgbaImage::new(image.width(), image.height());
-    for x in 0..width {
-        let mut sums = [0u32; 4];
-        for offset in 0..=radius {
-            let pixel = horizontal
-                .get_pixel(x as u32, offset.min(height - 1) as u32)
-                .0;
-            let copies = if offset == 0 { radius + 1 } else { 1 };
-            for channel in 0..4 {
-                sums[channel] += pixel[channel] as u32 * copies as u32;
-            }
-        }
-        for y in 0..height {
-            let mut pixel = [0u8; 4];
-            for channel in 0..4 {
-                pixel[channel] = ((sums[channel] + kernel / 2) / kernel) as u8;
-            }
-            output.put_pixel(x as u32, y as u32, Rgba(pixel));
-
-            let leaving = horizontal
-                .get_pixel(x as u32, y.saturating_sub(radius) as u32)
-                .0;
-            let entering = horizontal
-                .get_pixel(x as u32, (y + radius + 1).min(height - 1) as u32)
-                .0;
-            for channel in 0..4 {
-                sums[channel] = sums[channel] + entering[channel] as u32 - leaving[channel] as u32;
-            }
-        }
-    }
-    output
+    crate::raster::resize(image, width, height)
 }
 
 fn gaussian_blur_cpu(image: &RgbaImage, radius: u32) -> RgbaImage {
-    let mut output = image.clone();
-    for _ in 0..3 {
-        output = box_blur(&output, radius);
-    }
-    output
+    crate::raster::gaussian_blur(image, radius)
 }
 
 // GPU output is accepted only after a byte-for-byte comparison with the CPU
@@ -792,7 +634,7 @@ fn foreground_bbox(
     (left, top, right.max(left + 1), bottom.max(top + 1))
 }
 
-fn load_font(root: &Path, requested: Option<&str>) -> EngineResult<FontArc> {
+fn load_font(root: &Path, requested: Option<&str>) -> EngineResult<Option<PathBuf>> {
     let requested_path = requested.map(PathBuf::from).map(|path| {
         if path.is_absolute() {
             path
@@ -803,19 +645,18 @@ fn load_font(root: &Path, requested: Option<&str>) -> EngineResult<FontArc> {
             root.join("config/fonts").join(path)
         }
     });
-    let candidates = [
-        requested_path,
-        Some(root.join("config/fonts/AlibabaPuHuiTi-2-45-Light.otf")),
-        Some(root.join("config/fonts/Roboto-Regular.ttf")),
-    ];
-    for path in candidates.into_iter().flatten() {
-        if let Ok(bytes) = fs::read(path) {
-            if let Ok(font) = FontArc::try_from_vec(bytes) {
-                return Ok(font);
-            }
+    if requested.is_some_and(|value| !value.is_empty()) {
+        return Ok(requested_path.filter(|path| path.is_file()));
+    }
+    for path in [
+        root.join("config/fonts/AlibabaPuHuiTi-2-45-Light.otf"),
+        PathBuf::from("C:/Windows/Fonts/arial.ttf"),
+    ] {
+        if path.is_file() {
+            return Ok(Some(path));
         }
     }
-    Err("没有可用字体".to_owned())
+    Ok(None)
 }
 
 fn generate_text(root: &Path, node: &Value) -> EngineResult<RgbaImage> {
@@ -832,29 +673,24 @@ fn generate_text(root: &Path, node: &Value) -> EngineResult<RgbaImage> {
             .unwrap_or(&Value::String("black".to_owned())),
         Rgba([0, 0, 0, 255]),
     );
-    let scale = 512.0f32;
-    let (width, _) = text_size(scale, &font, &text);
-    let scaled_font = font.as_scaled(PxScale::from(scale));
-    let height = (scaled_font.ascent() - scaled_font.descent())
-        .ceil()
-        .max(1.0) as u32;
-    let mut image = RgbaImage::from_pixel(width.max(1), height.max(1), Rgba([0, 0, 0, 0]));
-    draw_text_mut(&mut image, color, 0, 0, scale, &font, &text);
+    let mut image = crate::text::render(font.as_deref(), &text, color)?;
     let trim = value_bool(node, "trim", false);
-    if trim && image.width() > 0 && image.height() > 0 {
-        let (left, top, right, bottom) = foreground_bbox(&image, true, true, true, true);
-        image = imageops::crop_imm(&image, left, top, right - left, bottom - top).to_image();
-    }
+    // Upstream always trims left/right; `trim` only controls top/bottom.
+    let (left, top, right, bottom) = foreground_bbox(&image, true, true, trim, trim);
+    image = imageops::crop_imm(&image, left, top, right - left, bottom - top).to_image();
     let requested_height = value_i64(node, "height", 100) as f64;
     let target_height = if value_bool(node, "is_bold", false) {
         requested_height * 1.13
     } else {
         requested_height
     };
+    let factor = target_height / image.height() as f64;
     Ok(resize_image(
         &image,
-        None,
-        Some(target_height.max(1.0) as u32),
+        // Pillow computes the width from the fractional bold height before
+        // truncating either dimension (e.g. 22 * 1.13 = 24.86, not 24).
+        Some((image.width() as f64 * factor).max(1.0) as u32),
+        Some((image.height() as f64 * factor).max(1.0) as u32),
         None,
     ))
 }
@@ -1001,7 +837,7 @@ fn add_margin(
         (image.height() as i64 + top + bottom).max(1) as u32,
         color,
     );
-    alpha_over(&mut canvas, image, left, top);
+    imageops::replace(&mut canvas, image, left, top);
     canvas
 }
 
@@ -1026,33 +862,7 @@ fn crop_with_padding(image: &RgbaImage, left: i64, top: i64, width: u32, height:
 }
 
 fn rounded_corner(image: &RgbaImage, radius: i64) -> RgbaImage {
-    let mut output = image.clone();
-    let radius = radius.max(0) as f64;
-    if radius == 0.0 {
-        return output;
-    }
-    for y in 0..output.height() {
-        for x in 0..output.width() {
-            let nearest_x = if (x as f64) < radius {
-                radius
-            } else if x as f64 > output.width() as f64 - radius {
-                output.width() as f64 - radius
-            } else {
-                x as f64
-            };
-            let nearest_y = if (y as f64) < radius {
-                radius
-            } else if y as f64 > output.height() as f64 - radius {
-                output.height() as f64 - radius
-            } else {
-                y as f64
-            };
-            if ((x as f64 - nearest_x).powi(2) + (y as f64 - nearest_y).powi(2)).sqrt() > radius {
-                output.get_pixel_mut(x, y).0[3] = 0;
-            }
-        }
-    }
-    output
+    crate::raster::rounded_corner(image, radius)
 }
 
 fn shadow(image: &RgbaImage, radius: i64, color: Rgba<u8>) -> RgbaImage {
@@ -1201,7 +1011,7 @@ fn watermark(root: &Path, image: &RgbaImage, node: &Value) -> EngineResult<RgbaI
             - right_top.width().max(right_bottom.width()) as i64
             - common_spacing * 2
             - delimiter_width;
-        let delimiter_y = footer_y + elem_margin - (logo_size as f64 * 0.05) as i64;
+        let delimiter_y = (footer_y as f64 + elem_margin as f64 - logo_size as f64 * 0.05) as i64;
         let delimiter = RgbaImage::from_pixel(
             delimiter_width.max(1) as u32,
             (logo_size as f64 * 1.1) as u32,
@@ -1539,38 +1349,62 @@ fn load_image_with_wic(path: &Path) -> EngineResult<RgbaImage> {
     }
 }
 
-fn same_file_path(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
-            .canonicalize()
-            .ok()
-            .zip(right.canonicalize().ok())
-            .is_some_and(|(left, right)| left == right)
-}
-
 fn process_pipeline_with_source(
     root: &Path,
     nodes: &[Value],
-    input_path: &Path,
     initial: RgbaImage,
-    source_override: Option<&RgbaImage>,
 ) -> EngineResult<RgbaImage> {
     if nodes.is_empty() {
         return Err("模板没有处理节点".to_owned());
     }
-    let mut output = vec![initial.clone()];
-    let mut all_buffers = vec![vec![initial]];
+    // Plan buffer uses before rendering. Move the last use instead of cloning
+    // every full frame at every node, and release dead branches immediately.
+    let mut uses = vec![0usize; nodes.len() + 1];
+    let mut plans = Vec::with_capacity(nodes.len());
     let mut last_merger: i64 = -1;
     for (index, node) in nodes.iter().enumerate() {
-        let node_started = std::time::Instant::now();
-        let name = node
-            .get("processor_name")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let input = if node.get("buffer_path").is_some()
-            && node.get("select").is_none()
-            && !matches!(name, "concat" | "alignment")
-        {
+        let name = node["processor_name"].as_str().unwrap_or("");
+        let plan = if node.get("select").is_some() {
+            let mut selected = Vec::new();
+            for value in parse_json_array(node, "select") {
+                let raw = value.as_i64().ok_or("select 必须是整数索引")?;
+                let resolved = if raw < 0 { index as i64 + 1 + raw } else { raw };
+                if resolved < 0 || resolved > index as i64 {
+                    return Err(format!("无效的缓冲区索引: {raw}"));
+                }
+                selected.push(resolved as usize);
+            }
+            Some(selected)
+        } else if matches!(name, "concat" | "alignment") {
+            let indices = ((last_merger + 1) as usize..=index).collect();
+            last_merger = index as i64;
+            Some(indices)
+        } else if node.get("buffer_path").is_some() {
+            None
+        } else {
+            Some(vec![index])
+        };
+        if let Some(indices) = &plan {
+            for &i in indices {
+                uses[i] += 1;
+            }
+        }
+        plans.push(plan);
+    }
+    let mut buffers = vec![Some(vec![initial])];
+    for (index, (node, plan)) in nodes.iter().zip(plans).enumerate() {
+        let mut input = Vec::new();
+        if let Some(indices) = plan {
+            for i in indices {
+                uses[i] -= 1;
+                let images = if uses[i] == 0 {
+                    buffers[i].take().unwrap()
+                } else {
+                    buffers[i].as_ref().unwrap().clone()
+                };
+                input.extend(images);
+            }
+        } else {
             let paths: Vec<String> = match node.get("buffer_path") {
                 Some(Value::String(path)) => vec![path.clone()],
                 Some(Value::Array(paths)) => paths
@@ -1578,52 +1412,27 @@ fn process_pipeline_with_source(
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect(),
-                _ => Vec::new(),
+                _ => return Err("buffer_path 必须是路径或路径数组".to_owned()),
             };
-            paths
+            input = paths
                 .iter()
-                .map(|path| {
-                    if let Some(source) =
-                        source_override.filter(|_| same_file_path(Path::new(path), input_path))
-                    {
-                        Ok(source.clone())
-                    } else {
-                        load_image(Path::new(path))
-                    }
-                })
-                .collect::<EngineResult<Vec<_>>>()?
-        } else if node.get("select").is_some() {
-            parse_json_array(node, "select")
-                .iter()
-                .filter_map(Value::as_i64)
-                .filter_map(|idx| all_buffers.get(idx as usize))
-                .flatten()
-                .cloned()
-                .collect()
-        } else if matches!(name, "concat" | "alignment") {
-            let start = (last_merger + 1) as usize;
-            let merged = all_buffers[start..=index]
-                .iter()
-                .flatten()
-                .cloned()
-                .collect();
-            last_merger = index as i64;
-            merged
+                .map(|path| load_image(Path::new(path)))
+                .collect::<EngineResult<Vec<_>>>()?;
+        }
+        let output = process_node(root, node, input)?;
+        if index + 1 == nodes.len() {
+            return output
+                .into_iter()
+                .next()
+                .ok_or("处理器没有生成图像".to_owned());
+        }
+        buffers.push(if uses[index + 1] == 0 {
+            None
         } else {
-            output
-        };
-        output = process_node(root, node, input)?;
-        eprintln!(
-            "LiteExif node {index} {name}: {:?} ({} output image(s))",
-            node_started.elapsed(),
-            output.len()
-        );
-        all_buffers.push(output.clone());
+            Some(output)
+        });
     }
-    output
-        .into_iter()
-        .next()
-        .ok_or("处理器没有生成图像".to_owned())
+    unreachable!()
 }
 
 pub fn process_pipeline(
@@ -1632,37 +1441,30 @@ pub fn process_pipeline(
     input_path: &Path,
 ) -> EngineResult<RgbaImage> {
     let initial = load_image(input_path)?;
-    process_pipeline_with_source(root, nodes, input_path, initial, None)
+    process_pipeline_with_source(root, nodes, initial)
 }
 
 pub fn process_pipeline_preview_from_image(
     root: &Path,
     nodes: &[Value],
-    input_path: &Path,
+    _input_path: &Path,
     initial: RgbaImage,
     max_dimension: u32,
 ) -> EngineResult<RgbaImage> {
-    let largest_side = initial.width().max(initial.height());
-    let preview_source = if largest_side > max_dimension {
-        let scale = max_dimension as f64 / largest_side as f64;
-        // Preview pixels are transient.  A bilinear reduction is dramatically
-        // faster than the export-quality Lanczos pass for 40MP camera files.
-        imageops::resize(
-            &initial,
-            (initial.width() as f64 * scale).max(1.0) as u32,
-            (initial.height() as f64 * scale).max(1.0) as u32,
-            FilterType::Triangle,
-        )
-    } else {
-        initial
-    };
-    process_pipeline_with_source(
-        root,
-        nodes,
-        input_path,
-        preview_source.clone(),
-        Some(&preview_source),
-    )
+    let output = process_pipeline_with_source(root, nodes, initial)?;
+    // Export drops alpha before encoding. Do so before reducing the preview,
+    // otherwise premultiplied resizing changes translucent watermark edges.
+    let output = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(output).into_rgb8()).into_rgba8();
+    let largest_side = output.width().max(output.height());
+    if largest_side <= max_dimension {
+        return Ok(output);
+    }
+    let scale = max_dimension as f64 / largest_side as f64;
+    Ok(resize_lanczos_parallel(
+        &output,
+        (output.width() as f64 * scale).max(1.0) as u32,
+        (output.height() as f64 * scale).max(1.0) as u32,
+    ))
 }
 
 pub fn save_image(
@@ -1681,10 +1483,10 @@ pub fn save_image(
         Some("jpg") | Some("jpeg") => {
             let file = fs::File::create(path).map_err(|error| error.to_string())?;
             let mut encoder = jpeg_encoder::Encoder::new(BufWriter::new(file), quality);
-            encoder.set_sampling_factor(if subsampling == 2 {
-                jpeg_encoder::SamplingFactor::F_2_2
-            } else {
-                jpeg_encoder::SamplingFactor::F_1_1
+            encoder.set_sampling_factor(match subsampling {
+                2 => jpeg_encoder::SamplingFactor::F_2_2,
+                1 => jpeg_encoder::SamplingFactor::F_2_1,
+                _ => jpeg_encoder::SamplingFactor::F_1_1,
             });
             let rgb = DynamicImage::ImageRgba8(image.clone()).into_rgb8();
             encoder
@@ -1698,12 +1500,14 @@ pub fn save_image(
         }
         Some("png") => {
             let file = fs::File::create(path).map_err(|error| error.to_string())?;
+            // semi-utils converts the final output to RGB for every format.
+            let rgb = DynamicImage::ImageRgba8(image.clone()).into_rgb8();
             image::codecs::png::PngEncoder::new(BufWriter::new(file))
                 .write_image(
-                    image.as_raw(),
+                    rgb.as_raw(),
                     image.width(),
                     image.height(),
-                    image::ExtendedColorType::Rgba8,
+                    image::ExtendedColorType::Rgb8,
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -1739,6 +1543,86 @@ pub fn copy_runtime_resources(resources: &Path, runtime: &Path) -> EngineResult<
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "generate fixtures with scripts/render-reference.py first"]
+    fn compare_semi_utils_reference() {
+        let directory =
+            PathBuf::from(std::env::var_os("LITEEXIF_PARITY_DIR").expect("LITEEXIF_PARITY_DIR"));
+        check_reference(&directory, true);
+    }
+
+    #[test]
+    fn bundled_templates_and_text_match_semi_utils() {
+        check_reference(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/render-parity"),
+            false,
+        );
+    }
+
+    fn check_reference(directory: &Path, write_outputs: bool) {
+        let cases: Vec<Value> =
+            serde_json::from_slice(&fs::read(directory.join("fixtures.json")).unwrap()).unwrap();
+        let root = project_root();
+        initialize_gpu_acceleration();
+        let mut metrics = Vec::new();
+        let mut failures = Vec::new();
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let input = directory.join(case["input"].as_str().unwrap());
+            let nodes = if let Some(template) = case["template"].as_str() {
+                let exif = serde_json::from_value(case["exif"].clone()).unwrap();
+                let rendered = render_template(&root, template, &exif, &input, &[]).unwrap();
+                serde_json::from_str::<Vec<Value>>(&rendered).unwrap()
+            } else {
+                serde_json::from_value(case["nodes"].clone()).unwrap()
+            };
+            let started = std::time::Instant::now();
+            let output = process_pipeline(&root, &nodes, &input).unwrap();
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            if write_outputs {
+                output
+                    .save(directory.join(format!("{name}-rust.png")))
+                    .unwrap();
+            }
+            let expected = load_image(&directory.join(format!("{name}-reference.png"))).unwrap();
+            // Full templates export RGB; isolated processors also compare alpha.
+            let channels = if case["template"].is_string() { 3 } else { 4 };
+            let mut error = 0u64;
+            let mut maximum = 0;
+            if output.dimensions() == expected.dimensions() {
+                for (a, b) in output.pixels().zip(expected.pixels()) {
+                    for c in 0..channels {
+                        let delta = a[c].abs_diff(b[c]);
+                        error += delta as u64;
+                        maximum = maximum.max(delta);
+                    }
+                }
+            }
+            if output.dimensions() != expected.dimensions() || maximum > 0 {
+                failures.push(format!(
+                    "{name}: {:?} vs {:?}, max channel error {maximum}",
+                    output.dimensions(),
+                    expected.dimensions()
+                ));
+            }
+            let mae =
+                error as f64 / (output.width() as f64 * output.height() as f64 * channels as f64);
+            metrics.push(json!({"name":name,"expected":expected.dimensions(),"actual":output.dimensions(),"mae":mae,"max_error":maximum,"rust_ms":elapsed,"reference_ms":case["reference_ms"]}));
+        }
+        if write_outputs {
+            fs::write(
+                directory.join("metrics.json"),
+                serde_json::to_vec_pretty(&metrics).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(
+            failures.is_empty(),
+            "Reference mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
+
     fn project_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1765,24 +1649,14 @@ mod tests {
     }
 
     #[test]
-    fn maker_note_lens_is_available_to_standard_templates() {
-        let mut exif = HashMap::from([
-            ("Model".to_owned(), "NIKON D810".to_owned()),
-            ("Lens".to_owned(), "70-200mm f/2.8".to_owned()),
-            ("FNumber".to_owned(), "2.8".to_owned()),
-        ]);
-
-        normalize_exif_fields(&mut exif);
-
-        assert_eq!(
-            exif.get("LensModel").map(String::as_str),
-            Some("70-200mm f/2.8")
-        );
-        assert_eq!(
-            exif.get("CameraModelName").map(String::as_str),
-            Some("NIKON D810")
-        );
-        assert_eq!(exif.get("AperatureValue").map(String::as_str), Some("2.8"));
+    fn upstream_exif_keys_preserve_missing_field_defaults() {
+        let exif =
+            parse_exif("Camera Model Name : NIKON D810\nLens : 70-200mm f/2.8\nF Number : 2.8\n");
+        let rendered = render_template(&project_root(),
+            "{{exif.CameraModelName}}|{{exif.LensModel|default('-')}}|{{exif.AperatureValue or exif.FNumber}}",
+            &exif, Path::new("photo.jpg"), &[]).unwrap();
+        assert_eq!(rendered, "NIKON D810|-|2.8");
+        assert!(!exif.contains_key("LensModel"));
     }
 
     #[test]
@@ -1838,25 +1712,6 @@ mod tests {
                 cpu.as_raw(),
                 "GPU mismatch on {adapter}, radius {radius}"
             );
-        }
-    }
-
-    #[test]
-    fn parallel_lanczos_matches_image_crate_byte_for_byte() {
-        let mut source = RgbaImage::new(37, 23);
-        for (x, y, pixel) in source.enumerate_pixels_mut() {
-            *pixel = Rgba([
-                ((x * 17 + y * 29) % 256) as u8,
-                ((x * x + y * 11) % 256) as u8,
-                ((x * 7 + y * y) % 256) as u8,
-                ((x * 13 + y * 19 + 31) % 256) as u8,
-            ]);
-        }
-        for dimensions in [(74, 46), (51, 31), (19, 11), (13, 41)] {
-            let expected =
-                imageops::resize(&source, dimensions.0, dimensions.1, FilterType::Lanczos3);
-            let actual = resize_lanczos_parallel(&source, dimensions.0, dimensions.1);
-            assert_eq!(actual.as_raw(), expected.as_raw(), "size {dimensions:?}");
         }
     }
 
