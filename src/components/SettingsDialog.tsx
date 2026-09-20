@@ -1,6 +1,7 @@
 import CodeMirror from "@uiw/react-codemirror";
 import { json } from "@codemirror/lang-json";
 import { CopyPlus, FilePlus2, FolderOpen, Settings2, X } from "lucide-react";
+import { Select } from "./Select";
 import type { AppConfig } from "../types";
 
 interface Props {
@@ -110,13 +111,13 @@ export function SettingsDialog({
                 </button>
               </div>
             </div>
-            <select value={draft.template_name} onChange={(event) => onSwitchTemplate(event.target.value)}>
-              {draft.templates.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-            </select>
+            <Select
+              value={draft.template_name}
+              options={draft.templates}
+              onChange={onSwitchTemplate}
+              placeholder="选择模板"
+              ariaLabel="水印模板"
+            />
             <div className="code-editor">
               <CodeMirror
                 value={draft.template}
