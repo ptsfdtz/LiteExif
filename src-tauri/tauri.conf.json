@@ -31,6 +31,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",
@@ -44,6 +45,14 @@
       "../exiftool": "exiftool",
       "../licenses": "licenses",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/ptsfdtz/LiteExif/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMwQjRDMkI5NUVBNDMxMDgKUldRSU1hUmV1Y0swd042ZWxENW5jdzA5d1F6RDlqbDVhcHpacWJwT0JSZWlhWE9aaEgyZk9wVHEK"
     }
   }
 }

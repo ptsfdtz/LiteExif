@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   Aperture,
   Check,
+  Download,
   FileImage,
   Gauge,
   Play,
@@ -17,6 +18,7 @@ import { FileContextMenu } from "./components/FileContextMenu";
 import { FileTree } from "./components/FileTree";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TemplateDialog } from "./components/TemplateDialog";
+import { UpdateDialog } from "./components/UpdateDialog";
 import { WindowControls, toggleMaximize } from "./components/WindowControls";
 import { ZoomablePreview } from "./components/ZoomablePreview";
 import type { AppConfig, EngineEvent, FileNode, FileTrees, ProgressState } from "./types";
@@ -86,6 +88,8 @@ export default function App() {
   const [toast, setToast] = useState<{ text: string; kind: "success" | "error" } | null>(null);
   const [acceleration, setAcceleration] = useState<AccelerationStatus | null>(null);
   const [previewCacheHit, setPreviewCacheHit] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
+  const [updateManual, setUpdateManual] = useState(false);
   const previewRequest = useRef(0);
 
   const notify = useCallback((text: string, kind: "success" | "error" = "success") => {
@@ -181,6 +185,20 @@ export default function App() {
     }).then((cleanup) => { unlisten = cleanup; });
     return () => unlisten?.();
   }, []);
+
+  // 启动后自动检查更新，发现新版本时提醒用户升级到最新版。
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setUpdateManual(false);
+      setUpdateOpen(true);
+    }, 2500);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  const checkUpdates = () => {
+    setUpdateManual(true);
+    setUpdateOpen(true);
+  };
 
   const inputRoot = trees.input_files[0] ?? null;
   const outputRoot = trees.output_files[0] ?? null;
@@ -397,6 +415,9 @@ export default function App() {
               ? `DX12 · ${acceleration.adapter?.replace("NVIDIA GeForce ", "") ?? "GPU"}${previewCacheHit ? " · 缓存" : ""}`
               : acceleration?.state === "disabled" ? "GPU 不可用 · CPU" : `GPU 待触发${previewCacheHit ? " · 缓存" : ""}`}
         </div>
+        <button className="icon-button" onClick={checkUpdates} title="检查更新">
+          <Download size={17} />
+        </button>
         <button className="icon-button settings-trigger" onClick={openSettings} title="导出设置">
           <Settings2 size={17} />
         </button>
@@ -526,6 +547,7 @@ export default function App() {
         />
       )}
       {toast && <div className={`toast ${toast.kind}`}><span>{toast.kind === "success" ? <Check size={16} /> : <X size={16} />}</span>{toast.text}</div>}
+      {updateOpen && <UpdateDialog manual={updateManual} onClose={() => setUpdateOpen(false)} />}
     </div>
   );
 }

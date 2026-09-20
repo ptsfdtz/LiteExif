@@ -1128,6 +1128,57 @@ input[type="range"] {
 .button.danger:hover:not(:disabled) {
   background: var(--signal-dark);
 }
+
+/* ---------- 更新提示 ---------- */
+.update-dialog {
+  width: min(460px, calc(100vw - 32px));
+}
+.update-version {
+  margin: 0;
+  font-size: 13px;
+  color: #3e4248;
+}
+.update-hint {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #555a62;
+}
+.update-notes {
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7f8fa;
+  color: #3e4248;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.update-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 7px;
+  font-size: 11.5px;
+  color: #777c84;
+}
+.progress-track.is-indeterminate > span {
+  animation: indeterminate 1.1s ease-in-out infinite;
+}
+@keyframes indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
 .launch-screen {
   width: 100%;
   height: 100%;

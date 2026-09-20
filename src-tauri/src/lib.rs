@@ -452,6 +452,8 @@ pub fn run() {
     initialize_gpu_acceleration();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_config,
             get_acceleration_status,

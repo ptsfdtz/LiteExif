@@ -6,6 +6,8 @@
   "permissions": [
     "core:default",
     "dialog:allow-open",
+    "updater:default",
+    "process:allow-restart",
     "core:window:allow-minimize",
     "core:window:allow-maximize",
     "core:window:allow-unmaximize",

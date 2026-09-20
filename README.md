@@ -60,6 +60,27 @@ pnpm desktop:build
 
 安装包输出到 `src-tauri/target/release/bundle/nsis/`。
 
+## 发布与自动更新
+
+推送 `v*` 形式的标签会触发 `.github/workflows/release.yml`：先运行 CI 校验，然后在 Windows runner 上构建 NSIS 安装包并自动创建或更新对应的 GitHub Release（含 Tauri 更新产物与 `latest.json`）。
+
+```powershell
+# 1. 同步版本号（package.json、src-tauri/tauri.conf.json、src-tauri/Cargo.toml 必须一致）
+pnpm version:check
+# 2. 打标签并推送
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+仓库需要在 GitHub Secrets 中配置 Tauri 更新签名私钥（与 LiteMark 共用同一把密钥）：
+
+- `TAURI_SIGNING_PRIVATE_KEY_V3`：私钥内容
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD_V3`：私钥密码
+
+本地执行 `pnpm desktop:build` 时同样需要设置 `TAURI_SIGNING_PRIVATE_KEY`，否则无法生成更新签名产物。
+
+应用启动后会自动向 `releases/latest/download/latest.json` 检查更新，发现新版本时弹出提示，用户确认后自动下载、安装并重启；标题栏的下载图标也可以手动检查更新。
+
 ## 项目结构
 
 - `src/`：React 与 TypeScript 桌面界面

@@ -58,6 +58,16 @@ pub fn render(path: Option<&Path>, text: &str, color: Rgba<u8>) -> Result<RgbaIm
     })
 }
 
+struct PositionedGlyph {
+    x: i64,
+    left: i32,
+    top: i32,
+    width: usize,
+    rows: usize,
+    pitch: usize,
+    buffer: Vec<u8>,
+}
+
 fn render_face(font: &CachedFont, text: &str, color: Rgba<u8>) -> Result<RgbaImage, String> {
     let face = &font.face;
     let pixel = |n: i64| (n + 32) >> 6;
@@ -67,7 +77,9 @@ fn render_face(font: &CachedFont, text: &str, color: Rgba<u8>) -> Result<RgbaIma
     let mut pen = 0i64;
     let mut left = 0i64;
     let mut right = 0i64;
-    let mut positions = Vec::new();
+    // Load each glyph with rendering enabled once. The bitmap is copied out of
+    // the reusable FreeType slot so bounds and pixels come from a single load.
+    let mut glyphs = Vec::new();
     let mut previous = 0;
     for character in text.chars() {
         let id = face.get_char_index(character as usize).unwrap_or(0);
@@ -79,36 +91,49 @@ fn render_face(font: &CachedFont, text: &str, color: Rgba<u8>) -> Result<RgbaIma
             pen += pixel(delta.x as i64);
         }
         let x = pixel(pen);
-        face.load_glyph(id, LoadFlag::DEFAULT)
+        face.load_glyph(id, LoadFlag::RENDER)
             .map_err(|e| e.to_string())?;
-        let bounds = face
-            .glyph()
+        let slot = face.glyph();
+        // Copy the rendered bitmap before `get_glyph`, whose temporary
+        // `FT_Glyph` can release the memory backing the slot's bitmap.
+        let bitmap = slot.bitmap();
+        let width = bitmap.width() as usize;
+        let rows = bitmap.rows() as usize;
+        let pitch = bitmap.pitch().unsigned_abs() as usize;
+        let buffer = if width > 0 && rows > 0 {
+            bitmap.buffer().to_vec()
+        } else {
+            Vec::new()
+        };
+        let bounds = slot
             .get_glyph()
             .map_err(|e| e.to_string())?
             .get_cbox(freetype::ffi::FT_GLYPH_BBOX_PIXELS);
         left = left.min(x + bounds.xMin as i64);
         right = right.max(x + bounds.xMax as i64);
-        pen += face.glyph().metrics().horiAdvance as i64;
+        pen += slot.metrics().horiAdvance as i64;
         right = right.max(pixel(pen));
-        positions.push((id, x, 0));
+        glyphs.push(PositionedGlyph {
+            x,
+            left: slot.bitmap_left(),
+            top: slot.bitmap_top(),
+            width,
+            rows,
+            pitch,
+            buffer,
+        });
         previous = id;
     }
     let mut image = RgbaImage::new((right - left).max(1) as u32, height.max(1) as u32);
-    for (id, x, y) in positions {
-        face.load_glyph(id, LoadFlag::RENDER)
-            .map_err(|e| e.to_string())?;
-        let slot = face.glyph();
-        let bitmap = slot.bitmap();
-        for row in 0..bitmap.rows() {
-            for col in 0..bitmap.width() {
-                let px = x + slot.bitmap_left() as i64 + col as i64;
-                let py = ascent - y - slot.bitmap_top() as i64 + row as i64;
+    for glyph in glyphs {
+        for row in 0..glyph.rows {
+            for col in 0..glyph.width {
+                let px = glyph.x + glyph.left as i64 + col as i64;
+                let py = ascent - glyph.top as i64 + row as i64;
                 if px < 0 || py < 0 || px >= image.width() as i64 || py >= image.height() as i64 {
                     continue;
                 }
-                let coverage = bitmap.buffer()
-                    [row as usize * bitmap.pitch().unsigned_abs() as usize + col as usize]
-                    as u32;
+                let coverage = glyph.buffer[row * glyph.pitch + col] as u32;
                 if coverage == 0 {
                     continue;
                 }
