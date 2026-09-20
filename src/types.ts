@@ -13,6 +13,7 @@ export interface FileNode {
   value?: string;
   is_file?: boolean;
   children?: FileNode[];
+  has_more?: boolean;
 }
 
 export interface FileTrees {

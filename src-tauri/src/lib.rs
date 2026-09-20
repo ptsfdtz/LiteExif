@@ -5,7 +5,7 @@ mod text;
 
 use engine::{
     copy_runtime_resources, get_exif, gpu_acceleration_status, initialize_gpu_acceleration,
-    list_files as scan_files, list_templates, load_image, normalize_exif_dimensions,
+    list_directory, list_templates, load_image, normalize_exif_dimensions,
     process_pipeline_from_image, process_pipeline_preview_from_image, render_template, save_image,
     IniConfig,
 };
@@ -104,21 +104,66 @@ fn save_config(app: AppHandle, config: Value) -> Result<Value, String> {
     Ok(json!({"message":"配置已保存"}))
 }
 
-#[tauri::command]
-fn list_files(app: AppHandle) -> Result<Value, String> {
-    let root = runtime_root(&app)?;
-    let config = load_config(&root)?;
-    let suffixes: Vec<String> = config
+// One page of directory entries. Bounded so a folder with tens of thousands of
+// files never produces an oversized payload or an unrenderable list.
+const DIRECTORY_PAGE_SIZE: usize = 200;
+
+fn supported_suffixes(config: &IniConfig) -> Result<Vec<String>, String> {
+    Ok(config
         .get("DEFAULT", "supported_file_suffixes")?
         .split(',')
-        .map(str::to_owned)
-        .collect();
-    let input = PathBuf::from(config.get("DEFAULT", "input_folder")?);
-    let output = PathBuf::from(config.get("DEFAULT", "output_folder")?);
-    Ok(json!({
-        "input_files": [{"children": scan_files(&input, &suffixes), "label":"Root"}],
-        "output_files": [{"children": scan_files(&output, &suffixes), "label":"Root"}],
-    }))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
+#[tauri::command]
+async fn list_files(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = runtime_root(&app)?;
+        let config = load_config(&root)?;
+        let suffixes = supported_suffixes(&config)?;
+        let input = PathBuf::from(config.get("DEFAULT", "input_folder")?);
+        let output = PathBuf::from(config.get("DEFAULT", "output_folder")?);
+        // Only the first level is read. Deeper levels load on demand.
+        let (input_children, input_more) = list_directory(&input, &suffixes, 0, DIRECTORY_PAGE_SIZE);
+        let (output_children, output_more) =
+            list_directory(&output, &suffixes, 0, DIRECTORY_PAGE_SIZE);
+        Ok(json!({
+            "input_files": [{
+                "children": input_children,
+                "has_more": input_more,
+                "label": "Root",
+                "value": input.to_string_lossy(),
+            }],
+            "output_files": [{
+                "children": output_children,
+                "has_more": output_more,
+                "label": "Root",
+                "value": output.to_string_lossy(),
+            }],
+        }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn list_children(app: AppHandle, path: String, offset: usize) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = runtime_root(&app)?;
+        let config = load_config(&root)?;
+        let suffixes = supported_suffixes(&config)?;
+        let (children, has_more) = list_directory(
+            &PathBuf::from(path),
+            &suffixes,
+            offset,
+            DIRECTORY_PAGE_SIZE,
+        );
+        Ok(json!({"children": children, "has_more": has_more}))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -412,6 +457,7 @@ pub fn run() {
             get_acceleration_status,
             save_config,
             list_files,
+            list_children,
             get_template,
             create_template,
             set_active_template,

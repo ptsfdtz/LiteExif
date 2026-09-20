@@ -56,6 +56,14 @@ function flattenFiles(nodes: FileNode[]): string[] {
   return nodes.flatMap((node) => node.is_file && node.value ? [node.value] : flattenFiles(node.children ?? []));
 }
 
+function updateNode(nodes: FileNode[], path: string, updater: (node: FileNode) => FileNode): FileNode[] {
+  return nodes.map((node) => {
+    if (node.value === path) return updater(node);
+    if (node.children?.length) return { ...node, children: updateNode(node.children, path, updater) };
+    return node;
+  });
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -99,6 +107,51 @@ export default function App() {
     }
   }, [notify]);
 
+  // Directories load one level at a time. Appending a page keeps every request
+  // bounded so huge network folders never arrive (or render) all at once.
+  const applyChildren = useCallback(
+    (path: string, children: FileNode[], hasMore: boolean, append: boolean) => {
+      setTrees((previous) => {
+        const patch = (node: FileNode): FileNode => ({
+          ...node,
+          children: append ? [...(node.children ?? []), ...children] : children,
+          has_more: hasMore,
+        });
+        return {
+          input_files: updateNode(previous.input_files, path, patch),
+          output_files: updateNode(previous.output_files, path, patch),
+        };
+      });
+    },
+    [],
+  );
+
+  const loadChildren = useCallback(async (node: FileNode) => {
+    if (!node.value) return;
+    try {
+      const result = await invoke<{ children: FileNode[]; has_more: boolean }>("list_children", {
+        path: node.value,
+        offset: 0,
+      });
+      applyChildren(node.value, result.children, result.has_more, false);
+    } catch (error) {
+      notify(`无法读取目录：${errorMessage(error)}`, "error");
+    }
+  }, [applyChildren, notify]);
+
+  const loadMoreChildren = useCallback(async (node: FileNode) => {
+    if (!node.value) return;
+    try {
+      const result = await invoke<{ children: FileNode[]; has_more: boolean }>("list_children", {
+        path: node.value,
+        offset: node.children?.length ?? 0,
+      });
+      applyChildren(node.value, result.children, result.has_more, true);
+    } catch (error) {
+      notify(`无法读取目录：${errorMessage(error)}`, "error");
+    }
+  }, [applyChildren, notify]);
+
   const loadConfig = useCallback(async () => {
     const data = await invoke<AppConfig>("get_config");
     setConfig(data);
@@ -129,8 +182,10 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
-  const sourceNodes = trees.input_files[0]?.children ?? [];
-  const outputNodes = trees.output_files[0]?.children ?? [];
+  const inputRoot = trees.input_files[0] ?? null;
+  const outputRoot = trees.output_files[0] ?? null;
+  const sourceNodes = inputRoot?.children ?? [];
+  const outputNodes = outputRoot?.children ?? [];
   const allFiles = useMemo(() => flattenFiles(sourceNodes), [sourceNodes]);
 
   const updateSelection = (paths: string[], shouldSelect: boolean) => {
@@ -377,11 +432,24 @@ export default function App() {
                 onSelectionChange={updateSelection}
                 onPreview={(node) => showPreview(node, true)}
                 onContextMenu={openContextMenu}
+                onLoadChildren={loadChildren}
+                onLoadMore={loadMoreChildren}
+                rootHasMore={inputRoot?.has_more}
+                onLoadMoreRoot={() => inputRoot && loadMoreChildren(inputRoot)}
               />
             </div>
             <div className="tree-section output-tree">
               <div className="tree-section-title"><span>已输出</span><strong>{flattenFiles(outputNodes).length}</strong></div>
-              <FileTree nodes={outputNodes} previewPath={preview?.path} onPreview={(node) => showPreview(node)} onContextMenu={openContextMenu} />
+              <FileTree
+                nodes={outputNodes}
+                previewPath={preview?.path}
+                onPreview={(node) => showPreview(node)}
+                onContextMenu={openContextMenu}
+                onLoadChildren={loadChildren}
+                onLoadMore={loadMoreChildren}
+                rootHasMore={outputRoot?.has_more}
+                onLoadMoreRoot={() => outputRoot && loadMoreChildren(outputRoot)}
+              />
             </div>
           </div>
         </section>

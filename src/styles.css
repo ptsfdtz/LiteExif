@@ -411,6 +411,28 @@ select:focus-visible,
   color: #969ba2;
   font-size: 12px;
 }
+.tree-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  color: #969ba2;
+  font-size: 12px;
+}
+.tree-more {
+  margin: 2px 8px 4px;
+  padding: 4px 10px;
+  border: 1px dashed #c9cdd4;
+  border-radius: 7px;
+  background: transparent;
+  color: #6b7280;
+  font-size: 12px;
+  cursor: pointer;
+}
+.tree-more:hover {
+  background: #f1f2f4;
+  color: #3f434a;
+}
 
 /* ---------- 预览 ---------- */
 .preview-pane {

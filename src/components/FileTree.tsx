@@ -5,6 +5,7 @@ import {
   FileImage,
   Folder,
   FolderOpen,
+  RefreshCw,
 } from "lucide-react";
 import type { FileNode } from "../types";
 
@@ -16,7 +17,13 @@ interface Props {
   onSelectionChange?: (paths: string[], selected: boolean) => void;
   onPreview: (node: FileNode) => void;
   onContextMenu?: (node: FileNode, x: number, y: number) => void;
+  onLoadChildren?: (node: FileNode) => void | Promise<void>;
+  onLoadMore?: (node: FileNode) => void | Promise<void>;
+  rootHasMore?: boolean;
+  onLoadMoreRoot?: () => void | Promise<void>;
 }
+
+type SharedProps = Omit<Props, "nodes" | "rootHasMore" | "onLoadMoreRoot">;
 
 function collectFiles(node: FileNode): string[] {
   if (node.is_file && node.value) return [node.value];
@@ -32,17 +39,37 @@ function TreeRow({
   onSelectionChange,
   onPreview,
   onContextMenu,
-}: Props & { node: FileNode; depth: number }) {
-  const [expanded, setExpanded] = useState(depth < 1);
+  onLoadChildren,
+  onLoadMore,
+}: SharedProps & { node: FileNode; depth: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
   const paths = useMemo(() => collectFiles(node), [node]);
   const checkedCount = paths.filter((path) => selected?.has(path)).length;
   const checked = paths.length > 0 && checkedCount === paths.length;
   const partial = checkedCount > 0 && !checked;
   const isFolder = !node.is_file;
+  const children = node.children;
+
+  const expand = async () => {
+    if (expanded) {
+      setExpanded(false);
+      return;
+    }
+    setExpanded(true);
+    if (isFolder && children === undefined && !loading) {
+      setLoading(true);
+      try {
+        await onLoadChildren?.(node);
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
 
   const choose = () => {
     if (node.is_file) onPreview(node);
-    else setExpanded((value) => !value);
+    else void expand();
   };
 
   return (
@@ -60,7 +87,7 @@ function TreeRow({
         {isFolder ? (
           <button
             className="icon-button tree-toggle"
-            onClick={() => setExpanded((value) => !value)}
+            onClick={() => void expand()}
             title={expanded ? "折叠" : "展开"}
           >
             <ChevronRight size={14} className={expanded ? "is-rotated" : ""} />
@@ -97,40 +124,72 @@ function TreeRow({
           <span>{node.label}</span>
         </button>
       </div>
-      {isFolder &&
-        expanded &&
-        node.children?.map((child) => (
-          <TreeRow
-            key={child.value ?? `${node.label}-${child.label}`}
-            node={child}
-            depth={depth + 1}
-            nodes={[]}
-            selected={selected}
-            selectable={selectable}
-            previewPath={previewPath}
-            onSelectionChange={onSelectionChange}
-            onPreview={onPreview}
-            onContextMenu={onContextMenu}
-          />
-        ))}
+      {isFolder && expanded && (
+        <div className="tree-children">
+          {loading && (
+            <div className="tree-status" style={{ paddingInlineStart: `${26 + depth * 16}px` }}>
+              <RefreshCw size={12} className="is-spinning" />
+              <span>加载中…</span>
+            </div>
+          )}
+          {!loading &&
+            children?.map((child) => (
+              <TreeRow
+                key={child.value ?? `${node.label}-${child.label}`}
+                node={child}
+                depth={depth + 1}
+                selected={selected}
+                selectable={selectable}
+                previewPath={previewPath}
+                onSelectionChange={onSelectionChange}
+                onPreview={onPreview}
+                onContextMenu={onContextMenu}
+                onLoadChildren={onLoadChildren}
+                onLoadMore={onLoadMore}
+              />
+            ))}
+          {!loading && children && children.length === 0 && (
+            <div className="tree-status" style={{ paddingInlineStart: `${26 + depth * 16}px` }}>
+              无图片
+            </div>
+          )}
+          {!loading && node.has_more && (
+            <button
+              className="tree-more"
+              style={{ marginInlineStart: `${26 + depth * 16}px` }}
+              onClick={() => void onLoadMore?.(node)}
+            >
+              显示更多…
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
-export function FileTree(props: Props) {
-  if (!props.nodes.length) {
-    return <div className="empty-tree">目录中没有支持的图片</div>;
-  }
+export function FileTree({
+  nodes,
+  rootHasMore,
+  onLoadMoreRoot,
+  ...rest
+}: Props) {
   return (
     <div className="file-tree">
-      {props.nodes.map((node) => (
+      {!nodes.length && <div className="empty-tree">目录中没有支持的图片</div>}
+      {nodes.map((node) => (
         <TreeRow
           key={node.value ?? node.label}
-          {...props}
           node={node}
           depth={0}
+          {...rest}
         />
       ))}
+      {rootHasMore && (
+        <button className="tree-more" onClick={() => void onLoadMoreRoot?.()}>
+          显示更多…
+        </button>
+      )}
     </div>
   );
 }

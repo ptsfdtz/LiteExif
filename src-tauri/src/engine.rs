@@ -115,14 +115,25 @@ pub struct FileNode {
     pub children: Option<Vec<FileNode>>,
 }
 
-pub fn list_files(path: &Path, suffixes: &[String]) -> Vec<FileNode> {
+/// Lists one directory level, sorted (sub-directories first, then files by
+/// modification time). Results are paged so a folder with tens of thousands of
+/// entries never produces a single huge payload. Returns the page and whether
+/// more entries remain. Directories are returned without `children`; the
+/// frontend requests each level on demand (lazy loading), which keeps network
+/// folders such as NAS mounts responsive.
+pub fn list_directory(
+    path: &Path,
+    suffixes: &[String],
+    offset: usize,
+    limit: usize,
+) -> (Vec<FileNode>, bool) {
     if !path.exists() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let mut directories = Vec::new();
     let mut files = Vec::new();
     let Ok(entries) = fs::read_dir(path) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     for entry in entries.flatten() {
         let entry_path = entry.path();
@@ -138,23 +149,22 @@ pub fn list_files(path: &Path, suffixes: &[String]) -> Vec<FileNode> {
     }
     directories.sort_by(|a, b| b.0.to_lowercase().cmp(&a.0.to_lowercase()));
     files.sort_by(|a, b| {
-        let a_time = fs::metadata(&a.1).and_then(|meta| meta.modified()).ok();
-        let b_time = fs::metadata(&b.1).and_then(|meta| meta.modified()).ok();
+        // On Windows the modification time comes from the directory
+        // enumeration, so this stays cheap even on network shares.
+        let a_time = a.1.metadata().and_then(|meta| meta.modified()).ok();
+        let b_time = b.1.metadata().and_then(|meta| meta.modified()).ok();
         b_time
             .cmp(&a_time)
             .then_with(|| b.0.to_lowercase().cmp(&a.0.to_lowercase()))
     });
-    let mut result = Vec::new();
+    let mut items = Vec::with_capacity(directories.len() + files.len());
     for (name, child_path) in directories {
-        let children = list_files(&child_path, suffixes);
-        if !children.is_empty() {
-            result.push(FileNode {
-                label: name,
-                value: child_path.to_string_lossy().into_owned(),
-                is_file: None,
-                children: Some(children),
-            });
-        }
+        items.push(FileNode {
+            label: name,
+            value: child_path.to_string_lossy().into_owned(),
+            is_file: None,
+            children: None,
+        });
     }
     for (name, file_path) in files {
         let suffix = file_path
@@ -162,7 +172,7 @@ pub fn list_files(path: &Path, suffixes: &[String]) -> Vec<FileNode> {
             .map(|value| format!(".{}", value.to_string_lossy().to_ascii_lowercase()))
             .unwrap_or_default();
         if suffixes.iter().any(|value| value == &suffix) {
-            result.push(FileNode {
+            items.push(FileNode {
                 label: name,
                 value: file_path.to_string_lossy().into_owned(),
                 is_file: Some(true),
@@ -170,7 +180,10 @@ pub fn list_files(path: &Path, suffixes: &[String]) -> Vec<FileNode> {
             });
         }
     }
-    result
+    let total = items.len();
+    let page: Vec<FileNode> = items.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset + page.len() < total;
+    (page, has_more)
 }
 
 pub fn list_templates(root: &Path) -> Vec<String> {
@@ -1872,5 +1885,39 @@ mod tests {
 
         let output = process_pipeline(&root, &nodes, &input).unwrap();
         assert_eq!(output.dimensions(), (1728, 1151));
+    }
+
+    #[test]
+    fn list_directory_pages_and_stays_shallow() {
+        let base = std::env::temp_dir().join(format!("liteexif-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let nested = base.join("album").join("day1");
+        fs::create_dir_all(&nested).unwrap();
+        for index in 0..5 {
+            fs::write(base.join(format!("top{index}.jpg")), b"x").unwrap();
+        }
+        fs::write(nested.join("inner.jpg"), b"x").unwrap();
+        fs::write(base.join("notes.txt"), b"x").unwrap();
+
+        let suffixes = vec![".jpg".to_owned()];
+
+        // One page is capped, and directories are returned without children so
+        // the frontend decides when to read deeper levels.
+        let (first, has_more) = list_directory(&base, &suffixes, 0, 3);
+        assert_eq!(first.len(), 3);
+        assert!(has_more);
+        assert!(first.iter().all(|node| node.children.is_none()));
+
+        let (second, has_more) = list_directory(&base, &suffixes, 3, 3);
+        assert!(!has_more);
+        // One sub-directory plus five supported files; notes.txt is filtered.
+        assert_eq!(first.len() + second.len(), 6);
+
+        // The nested image only appears once that folder is requested.
+        let (album, _) = list_directory(&base.join("album"), &suffixes, 0, 10);
+        assert!(album.iter().any(|node| node.label == "day1"));
+        assert!(!album.iter().any(|node| node.label == "inner.jpg"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
