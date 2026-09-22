@@ -21,7 +21,13 @@ import { TemplateDialog } from "./components/TemplateDialog";
 import { UpdateDialog } from "./components/UpdateDialog";
 import { WindowControls, toggleMaximize } from "./components/WindowControls";
 import { ZoomablePreview } from "./components/ZoomablePreview";
-import type { AppConfig, EngineEvent, FileNode, FileTrees, ProgressState } from "./types";
+import type {
+  AppConfig,
+  EngineEvent,
+  FileNode,
+  FileTrees,
+  ProgressState,
+} from "./types";
 
 const emptyConfig: AppConfig = {
   input_folder: "",
@@ -55,13 +61,22 @@ type AccelerationStatus = {
 };
 
 function flattenFiles(nodes: FileNode[]): string[] {
-  return nodes.flatMap((node) => node.is_file && node.value ? [node.value] : flattenFiles(node.children ?? []));
+  return nodes.flatMap((node) =>
+    node.is_file && node.value
+      ? [node.value]
+      : flattenFiles(node.children ?? []),
+  );
 }
 
-function updateNode(nodes: FileNode[], path: string, updater: (node: FileNode) => FileNode): FileNode[] {
+function updateNode(
+  nodes: FileNode[],
+  path: string,
+  updater: (node: FileNode) => FileNode,
+): FileNode[] {
   return nodes.map((node) => {
     if (node.value === path) return updater(node);
-    if (node.children?.length) return { ...node, children: updateNode(node.children, path, updater) };
+    if (node.children?.length)
+      return { ...node, children: updateNode(node.children, path, updater) };
     return node;
   });
 }
@@ -74,28 +89,48 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig>(emptyConfig);
   const [draft, setDraft] = useState<AppConfig>(emptyConfig);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [trees, setTrees] = useState<FileTrees>({ input_files: [], output_files: [] });
+  const [trees, setTrees] = useState<FileTrees>({
+    input_files: [],
+    output_files: [],
+  });
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [preview, setPreview] = useState<{ path: string; name: string; url: string } | null>(null);
+  const [preview, setPreview] = useState<{
+    path: string;
+    name: string;
+    url: string;
+  } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [progress, setProgress] = useState<ProgressState>(emptyProgress);
   const [dialog, setDialog] = useState<"create" | "saveAs" | null>(null);
-  const [contextMenu, setContextMenu] = useState<{ node: FileNode; x: number; y: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    node: FileNode;
+    x: number;
+    y: number;
+  } | null>(null);
   const [pendingDelete, setPendingDelete] = useState<FileNode | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [toast, setToast] = useState<{ text: string; kind: "success" | "error" } | null>(null);
-  const [acceleration, setAcceleration] = useState<AccelerationStatus | null>(null);
+  const [toast, setToast] = useState<{
+    text: string;
+    kind: "success" | "error";
+  } | null>(null);
+  const [acceleration, setAcceleration] = useState<AccelerationStatus | null>(
+    null,
+  );
   const [previewCacheHit, setPreviewCacheHit] = useState(false);
+  const [previewOriginal, setPreviewOriginal] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [updateManual, setUpdateManual] = useState(false);
   const previewRequest = useRef(0);
 
-  const notify = useCallback((text: string, kind: "success" | "error" = "success") => {
-    setToast({ text, kind });
-    window.setTimeout(() => setToast(null), 3200);
-  }, []);
+  const notify = useCallback(
+    (text: string, kind: "success" | "error" = "success") => {
+      setToast({ text, kind });
+      window.setTimeout(() => setToast(null), 3200);
+    },
+    [],
+  );
 
   const refreshFiles = useCallback(async () => {
     setRefreshing(true);
@@ -103,7 +138,10 @@ export default function App() {
       const data = await invoke<FileTrees>("list_files");
       setTrees(data);
       const current = new Set(flattenFiles(data.input_files));
-      setSelected((previous) => new Set([...previous].filter((path) => current.has(path))));
+      setSelected(
+        (previous) =>
+          new Set([...previous].filter((path) => current.has(path))),
+      );
     } catch (error) {
       notify(`文件列表加载失败：${errorMessage(error)}`, "error");
     } finally {
@@ -130,31 +168,43 @@ export default function App() {
     [],
   );
 
-  const loadChildren = useCallback(async (node: FileNode) => {
-    if (!node.value) return;
-    try {
-      const result = await invoke<{ children: FileNode[]; has_more: boolean }>("list_children", {
-        path: node.value,
-        offset: 0,
-      });
-      applyChildren(node.value, result.children, result.has_more, false);
-    } catch (error) {
-      notify(`无法读取目录：${errorMessage(error)}`, "error");
-    }
-  }, [applyChildren, notify]);
+  const loadChildren = useCallback(
+    async (node: FileNode) => {
+      if (!node.value) return;
+      try {
+        const result = await invoke<{
+          children: FileNode[];
+          has_more: boolean;
+        }>("list_children", {
+          path: node.value,
+          offset: 0,
+        });
+        applyChildren(node.value, result.children, result.has_more, false);
+      } catch (error) {
+        notify(`无法读取目录：${errorMessage(error)}`, "error");
+      }
+    },
+    [applyChildren, notify],
+  );
 
-  const loadMoreChildren = useCallback(async (node: FileNode) => {
-    if (!node.value) return;
-    try {
-      const result = await invoke<{ children: FileNode[]; has_more: boolean }>("list_children", {
-        path: node.value,
-        offset: node.children?.length ?? 0,
-      });
-      applyChildren(node.value, result.children, result.has_more, true);
-    } catch (error) {
-      notify(`无法读取目录：${errorMessage(error)}`, "error");
-    }
-  }, [applyChildren, notify]);
+  const loadMoreChildren = useCallback(
+    async (node: FileNode) => {
+      if (!node.value) return;
+      try {
+        const result = await invoke<{
+          children: FileNode[];
+          has_more: boolean;
+        }>("list_children", {
+          path: node.value,
+          offset: node.children?.length ?? 0,
+        });
+        applyChildren(node.value, result.children, result.has_more, true);
+      } catch (error) {
+        notify(`无法读取目录：${errorMessage(error)}`, "error");
+      }
+    },
+    [applyChildren, notify],
+  );
 
   const loadConfig = useCallback(async () => {
     const data = await invoke<AppConfig>("get_config");
@@ -163,7 +213,9 @@ export default function App() {
   }, []);
 
   const refreshAcceleration = useCallback(async () => {
-    setAcceleration(await invoke<AccelerationStatus>("get_acceleration_status"));
+    setAcceleration(
+      await invoke<AccelerationStatus>("get_acceleration_status"),
+    );
   }, []);
 
   useEffect(() => {
@@ -182,7 +234,9 @@ export default function App() {
         active: payload.event !== "complete" && payload.event !== "error",
         complete: payload.event === "complete",
       }));
-    }).then((cleanup) => { unlisten = cleanup; });
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
     return () => unlisten?.();
   }, []);
 
@@ -209,12 +263,18 @@ export default function App() {
   const updateSelection = (paths: string[], shouldSelect: boolean) => {
     setSelected((current) => {
       const next = new Set(current);
-      paths.forEach((path) => shouldSelect ? next.add(path) : next.delete(path));
+      paths.forEach((path) =>
+        shouldSelect ? next.add(path) : next.delete(path),
+      );
       return next;
     });
   };
 
-  const showPreview = async (node: FileNode, processed = false, template = config.template) => {
+  const showPreview = async (
+    node: FileNode,
+    processed = false,
+    template = config.template,
+  ) => {
     if (!node.value) return;
     const request = ++previewRequest.current;
     setPreviewLoading(true);
@@ -222,21 +282,39 @@ export default function App() {
     try {
       const isHeic = /\.hei[cf]$/i.test(node.value);
       if (!isHeic) {
-        setPreview({ path: node.value, name: node.label, url: convertFileSrc(node.value) });
+        setPreview({
+          path: node.value,
+          name: node.label,
+          url: convertFileSrc(node.value),
+        });
       } else {
-        const source = await invoke<{ path: string }>("prepare_preview", { path: node.value });
+        const source = await invoke<{ path: string }>("prepare_preview", {
+          path: node.value,
+        });
         if (request === previewRequest.current) {
-          setPreview({ path: node.value, name: node.label, url: convertFileSrc(source.path) });
+          setPreview({
+            path: node.value,
+            name: node.label,
+            url: convertFileSrc(source.path),
+          });
         }
       }
       if (!processed || request !== previewRequest.current) return;
 
-      const result = await invoke<{ path: string; cache_hit: boolean; acceleration: AccelerationStatus }>("prepare_processed_preview", {
+      const result = await invoke<{
+        path: string;
+        cache_hit: boolean;
+        acceleration: AccelerationStatus;
+      }>("prepare_processed_preview", {
         path: node.value,
         template,
       });
       if (request === previewRequest.current) {
-        setPreview({ path: node.value, name: node.label, url: convertFileSrc(result.path) });
+        setPreview({
+          path: node.value,
+          name: node.label,
+          url: convertFileSrc(result.path),
+        });
         setPreviewCacheHit(result.cache_hit);
         setAcceleration(result.acceleration);
       }
@@ -250,26 +328,52 @@ export default function App() {
   };
 
   const chooseFolder = async (field: "input_folder" | "output_folder") => {
-    const selectedFolder = await open({ directory: true, multiple: false, defaultPath: draft[field] || undefined });
-    if (typeof selectedFolder === "string") setDraft((value) => ({ ...value, [field]: selectedFolder }));
+    const selectedFolder = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: draft[field] || undefined,
+    });
+    if (typeof selectedFolder === "string")
+      setDraft((value) => ({ ...value, [field]: selectedFolder }));
   };
 
-  const applyTemplateContent = useCallback((templateName: string, content: string) => {
-    setConfig((value) => ({ ...value, template_name: templateName, template: content }));
-    setDraft((value) => ({ ...value, template_name: templateName, template: content }));
-  }, []);
+  const applyTemplateContent = useCallback(
+    (templateName: string, content: string) => {
+      setConfig((value) => ({
+        ...value,
+        template_name: templateName,
+        template: content,
+      }));
+      setDraft((value) => ({
+        ...value,
+        template_name: templateName,
+        template: content,
+      }));
+    },
+    [],
+  );
 
   const switchTemplate = async (templateName: string) => {
     try {
-      const result = await invoke<{ content: string }>("get_template", { templateName });
+      const result = await invoke<{ content: string }>("get_template", {
+        templateName,
+      });
       applyTemplateContent(templateName, result.content);
+      setPreviewOriginal(false);
       try {
         await invoke("set_active_template", { templateName });
       } catch (error) {
-        notify(`模板已切换但自动保存失败，导出仍将使用旧模板：${errorMessage(error)}`, "error");
+        notify(
+          `模板已切换但自动保存失败，导出仍将使用旧模板：${errorMessage(error)}`,
+          "error",
+        );
       }
       if (preview) {
-        void showPreview({ label: preview.name, value: preview.path, is_file: true }, true, result.content);
+        void showPreview(
+          { label: preview.name, value: preview.path, is_file: true },
+          true,
+          result.content,
+        );
       }
     } catch (error) {
       notify(`模板加载失败：${errorMessage(error)}`, "error");
@@ -278,15 +382,23 @@ export default function App() {
 
   // 快捷按钮切换：settings 弹窗里改的草稿也要同步
   const switchTemplateFromBar = (templateName: string) => {
+    setPreviewOriginal(false);
     if (templateName === config.template_name) {
-      if (preview) void showPreview({ label: preview.name, value: preview.path, is_file: true }, true, config.template);
+      if (preview)
+        void showPreview(
+          { label: preview.name, value: preview.path, is_file: true },
+          true,
+          config.template,
+        );
       return;
     }
     void switchTemplate(templateName);
   };
 
   const toggleWindowMaximize = () => {
-    toggleMaximize().catch((error) => notify(`最大化失败：${errorMessage(error)}`, "error"));
+    toggleMaximize().catch((error) =>
+      notify(`最大化失败：${errorMessage(error)}`, "error"),
+    );
   };
 
   const openSettings = () => {
@@ -301,8 +413,12 @@ export default function App() {
       setConfig(draft);
       setSettingsOpen(false);
       await refreshFiles();
-      if (preview) {
-        void showPreview({ label: preview.name, value: preview.path, is_file: true }, true, draft.template);
+      if (preview && !previewOriginal) {
+        void showPreview(
+          { label: preview.name, value: preview.path, is_file: true },
+          true,
+          draft.template,
+        );
       }
       notify("配置已保存");
     } catch (error) {
@@ -315,15 +431,25 @@ export default function App() {
       const content = dialog === "saveAs" ? draft.template : "[]";
       JSON.parse(content);
       await invoke("create_template", { templateName: name, content });
-      const templates = [...draft.templates, name].sort((a, b) => a.localeCompare(b, "zh-CN"));
-      const next = { ...draft, templates, template_name: name, template: content };
+      const templates = [...draft.templates, name].sort((a, b) =>
+        a.localeCompare(b, "zh-CN"),
+      );
+      const next = {
+        ...draft,
+        templates,
+        template_name: name,
+        template: content,
+      };
       setDraft(next);
       setConfig(next);
       setDialog(null);
       try {
         await invoke("set_active_template", { templateName: name });
       } catch (error) {
-        notify(`模板已创建但自动保存失败，导出仍将使用旧模板：${errorMessage(error)}`, "error");
+        notify(
+          `模板已创建但自动保存失败，导出仍将使用旧模板：${errorMessage(error)}`,
+          "error",
+        );
         return;
       }
       notify(`已创建模板：${name}`);
@@ -333,7 +459,12 @@ export default function App() {
   };
 
   const startProcessing = async () => {
-    setProgress({ ...emptyProgress, active: true, total: selected.size, message: "准备处理" });
+    setProgress({
+      ...emptyProgress,
+      active: true,
+      total: selected.size,
+      message: "准备处理",
+    });
     try {
       await invoke("start_processing", { selectedItems: [...selected] });
       await refreshAcceleration();
@@ -381,7 +512,12 @@ export default function App() {
   };
 
   if (loading) {
-    return <div className="launch-screen"><Aperture size={32} /><span>LiteExif</span></div>;
+    return (
+      <div className="launch-screen">
+        <Aperture size={32} />
+        <span>LiteExif</span>
+      </div>
+    );
   }
 
   const exportDisabled = !selected.size || progress.active;
@@ -399,11 +535,17 @@ export default function App() {
           data-tauri-drag-region
           onDoubleClick={toggleWindowMaximize}
         >
-          <div className="brand-mark"><Aperture size={20} strokeWidth={2.3} /></div>
+          <div className="brand-mark">
+            <Aperture size={20} strokeWidth={2.3} />
+          </div>
           <div className="brand-name">LiteExif</div>
           <div className="topbar-meta">{__APP_VERSION__}</div>
         </div>
-        <div className="topbar-spacer" data-tauri-drag-region onDoubleClick={toggleWindowMaximize} />
+        <div
+          className="topbar-spacer"
+          data-tauri-drag-region
+          onDoubleClick={toggleWindowMaximize}
+        />
         <div
           className={`engine-state ${progress.active ? "is-busy" : ""} ${acceleration?.state === "disabled" ? "has-error" : ""}`}
           title={acceleration?.adapter ?? "GPU 将在需要模糊计算时初始化"}
@@ -413,16 +555,35 @@ export default function App() {
             ? "正在导出"
             : acceleration?.state === "validated"
               ? `DX12 · ${acceleration.adapter?.replace("NVIDIA GeForce ", "") ?? "GPU"}${previewCacheHit ? " · 缓存" : ""}`
-              : acceleration?.state === "disabled" ? "GPU 不可用 · CPU" : `GPU 待触发${previewCacheHit ? " · 缓存" : ""}`}
+              : acceleration?.state === "disabled"
+                ? "GPU 不可用 · CPU"
+                : `GPU 待触发${previewCacheHit ? " · 缓存" : ""}`}
         </div>
         <button className="icon-button" onClick={checkUpdates} title="检查更新">
           <Download size={17} />
         </button>
-        <button className="icon-button settings-trigger" onClick={openSettings} title="导出设置">
+        <button
+          className="icon-button settings-trigger"
+          onClick={openSettings}
+          title="导出设置"
+        >
           <Settings2 size={17} />
         </button>
-        <button className="topbar-export" disabled={exportDisabled} onClick={startProcessing} title={selected.size ? `导出选中的 ${selected.size} 张` : "先在左侧选择照片"}>
-          {progress.active ? <RefreshCw size={15} className="is-spinning" /> : <Play size={15} fill="currentColor" />}
+        <button
+          className="topbar-export"
+          disabled={exportDisabled}
+          onClick={startProcessing}
+          title={
+            selected.size
+              ? `导出选中的 ${selected.size} 张`
+              : "先在左侧选择照片"
+          }
+        >
+          {progress.active ? (
+            <RefreshCw size={15} className="is-spinning" />
+          ) : (
+            <Play size={15} fill="currentColor" />
+          )}
           <span>{exportLabel}</span>
         </button>
         <WindowControls onError={(message) => notify(message, "error")} />
@@ -431,27 +592,56 @@ export default function App() {
       <main className="workspace workspace-v2">
         <section className="files-pane">
           <div className="pane-heading">
-            <h2><FileImage size={16} />照片</h2>
-            <span className="pane-count">{selected.size}/{allFiles.length}</span>
-            <button className="icon-button" onClick={refreshFiles} disabled={refreshing} title="刷新目录">
-              <RefreshCw size={15} className={refreshing ? "is-spinning" : ""} />
+            <h2>
+              <FileImage size={16} />
+              照片
+            </h2>
+            <span className="pane-count">
+              {selected.size}/{allFiles.length}
+            </span>
+            <button
+              className="icon-button"
+              onClick={refreshFiles}
+              disabled={refreshing}
+              title="刷新目录"
+            >
+              <RefreshCw
+                size={15}
+                className={refreshing ? "is-spinning" : ""}
+              />
             </button>
           </div>
           <div className="tree-toolbar">
-            <button className="text-button" onClick={() => setSelected(selected.size === allFiles.length ? new Set() : new Set(allFiles))}>
-              {selected.size === allFiles.length && allFiles.length ? "取消全选" : "全选"}
+            <button
+              className="text-button"
+              onClick={() =>
+                setSelected(
+                  selected.size === allFiles.length
+                    ? new Set()
+                    : new Set(allFiles),
+                )
+              }
+            >
+              {selected.size === allFiles.length && allFiles.length
+                ? "取消全选"
+                : "全选"}
             </button>
           </div>
           <div className="tree-columns">
             <div className="tree-section">
-              <div className="tree-section-title"><span>待处理</span><strong>{selected.size}/{allFiles.length}</strong></div>
+              <div className="tree-section-title">
+                <span>待处理</span>
+                <strong>
+                  {selected.size}/{allFiles.length}
+                </strong>
+              </div>
               <FileTree
                 nodes={sourceNodes}
                 selected={selected}
                 selectable
                 previewPath={preview?.path}
                 onSelectionChange={updateSelection}
-                onPreview={(node) => showPreview(node, true)}
+                onPreview={(node) => showPreview(node, !previewOriginal)}
                 onContextMenu={openContextMenu}
                 onLoadChildren={loadChildren}
                 onLoadMore={loadMoreChildren}
@@ -460,7 +650,10 @@ export default function App() {
               />
             </div>
             <div className="tree-section output-tree">
-              <div className="tree-section-title"><span>已输出</span><strong>{flattenFiles(outputNodes).length}</strong></div>
+              <div className="tree-section-title">
+                <span>已输出</span>
+                <strong>{flattenFiles(outputNodes).length}</strong>
+              </div>
               <FileTree
                 nodes={outputNodes}
                 previewPath={preview?.path}
@@ -469,7 +662,9 @@ export default function App() {
                 onLoadChildren={loadChildren}
                 onLoadMore={loadMoreChildren}
                 rootHasMore={outputRoot?.has_more}
-                onLoadMoreRoot={() => outputRoot && loadMoreChildren(outputRoot)}
+                onLoadMoreRoot={() =>
+                  outputRoot && loadMoreChildren(outputRoot)
+                }
               />
             </div>
           </div>
@@ -478,37 +673,84 @@ export default function App() {
         <section className="preview-pane">
           <div className="pane-heading">
             <h2>预览</h2>
-            {preview && <span className="preview-filename" title={preview.name}>{preview.name}</span>}
+            {preview && (
+              <span className="preview-filename" title={preview.name}>
+                {preview.name}
+              </span>
+            )}
             {previewCacheHit && <span className="cache-badge">缓存</span>}
           </div>
 
-          <ZoomablePreview src={preview?.url ?? null} name={preview?.name ?? ""} loading={previewLoading} />
+          <ZoomablePreview
+            src={preview?.url ?? null}
+            name={preview?.name ?? ""}
+            loading={previewLoading}
+          />
 
           <div className="effect-bar" role="tablist" aria-label="效果切换">
+            <button
+              role="tab"
+              aria-selected={previewOriginal}
+              className={`effect-dot ${previewOriginal ? "is-active" : ""}`}
+              title="原图（不应用预设）"
+              onClick={() => {
+                setPreviewOriginal(true);
+                if (preview)
+                  void showPreview({
+                    label: preview.name,
+                    value: preview.path,
+                    is_file: true,
+                  });
+              }}
+            >
+              0
+            </button>
             {config.templates.map((name, index) => (
               <button
                 key={name}
                 role="tab"
-                aria-selected={config.template_name === name}
-                className={`effect-dot ${config.template_name === name ? "is-active" : ""}`}
+                aria-selected={
+                  !previewOriginal && config.template_name === name
+                }
+                className={`effect-dot ${!previewOriginal && config.template_name === name ? "is-active" : ""}`}
                 title={name}
                 onClick={() => switchTemplateFromBar(name)}
               >
                 {index + 1}
               </button>
             ))}
-            {!config.templates.length && <span className="effect-empty">暂无模板，可在设置中新建</span>}
+            {!config.templates.length && (
+              <span className="effect-empty">暂无模板，可在设置中新建</span>
+            )}
           </div>
-          {config.template_name && (
-            <div className="effect-name" title={config.template_name}>效果 {config.templates.indexOf(config.template_name) + 1} · {config.template_name}</div>
+          {(previewOriginal || config.template_name) && (
+            <div
+              className="effect-name"
+              title={previewOriginal ? "原图" : config.template_name}
+            >
+              {previewOriginal
+                ? "原图 · 不应用预设"
+                : `效果 ${config.templates.indexOf(config.template_name) + 1} · ${config.template_name}`}
+            </div>
           )}
 
           <div className="process-strip">
-            <div className="progress-track"><span style={{ width: `${progress.percent}%` }} /></div>
+            <div className="progress-track">
+              <span style={{ width: `${progress.percent}%` }} />
+            </div>
             <div className="progress-meta">
-              <span className="progress-label">{progress.message || (selected.size ? `已选 ${selected.size} 张，右上角开始导出` : "在左侧选择照片后导出")}</span>
+              <span className="progress-label">
+                {progress.message ||
+                  (selected.size
+                    ? `已选 ${selected.size} 张，右上角开始导出`
+                    : "在左侧选择照片后导出")}
+              </span>
               <span className="progress-stats">
-                完成 <strong>{progress.success}</strong> · 跳过 <strong>{progress.skipped}</strong> · <span className={progress.failure ? "has-error" : ""}>失败 <strong>{progress.failure}</strong></span>
+                完成 <strong>{progress.success}</strong> · 跳过{" "}
+                <strong>{progress.skipped}</strong> ·{" "}
+                <span className={progress.failure ? "has-error" : ""}>
+                  失败 <strong>{progress.failure}</strong>
+                </span>
               </span>
             </div>
           </div>
@@ -526,7 +768,13 @@ export default function App() {
           onCreateTemplate={(mode) => setDialog(mode)}
         />
       )}
-      {dialog && <TemplateDialog mode={dialog} onClose={() => setDialog(null)} onConfirm={createTemplate} />}
+      {dialog && (
+        <TemplateDialog
+          mode={dialog}
+          onClose={() => setDialog(null)}
+          onConfirm={createTemplate}
+        />
+      )}
       {contextMenu && (
         <FileContextMenu
           node={contextMenu.node}
@@ -546,8 +794,20 @@ export default function App() {
           onConfirm={executeDelete}
         />
       )}
-      {toast && <div className={`toast ${toast.kind}`}><span>{toast.kind === "success" ? <Check size={16} /> : <X size={16} />}</span>{toast.text}</div>}
-      {updateOpen && <UpdateDialog manual={updateManual} onClose={() => setUpdateOpen(false)} />}
+      {toast && (
+        <div className={`toast ${toast.kind}`}>
+          <span>
+            {toast.kind === "success" ? <Check size={16} /> : <X size={16} />}
+          </span>
+          {toast.text}
+        </div>
+      )}
+      {updateOpen && (
+        <UpdateDialog
+          manual={updateManual}
+          onClose={() => setUpdateOpen(false)}
+        />
+      )}
     </div>
   );
 }
