@@ -91,6 +91,7 @@ export function SettingsDialog({
                 min="1"
                 max="100"
                 value={draft.quality}
+                style={{ "--range-progress": `${draft.quality}%` } as React.CSSProperties}
                 onChange={(event) => onChange({ ...draft, quality: Number(event.target.value) })}
               />
             </section>

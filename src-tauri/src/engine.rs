@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufWriter;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -210,7 +212,12 @@ pub fn list_templates(root: &Path) -> Vec<String> {
 
 pub fn get_exif(root: &Path, path: &Path) -> HashMap<String, String> {
     let executable = root.join("exiftool/exiftool.exe");
-    let Ok(output) = Command::new(executable)
+    let mut command = Command::new(executable);
+    // exiftool is a console program; without CREATE_NO_WINDOW Windows spawns a
+    // visible console that flashes every time EXIF is read for a preview.
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let Ok(output) = command
         .args(["-d", "%Y-%m-%d %H:%M:%S%3f%z"])
         .arg(path)
         .output()
